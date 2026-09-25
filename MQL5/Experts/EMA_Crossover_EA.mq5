@@ -1,0 +1,552 @@
+//+------------------------------------------------------------------+
+//|                                             EMA_Crossover_EA.mq5 |
+//|                  Long-only EMA 40 / EMA 200 crossover strategy   |
+//+------------------------------------------------------------------+
+#property copyright   "bts-cg-claude-study"
+#property version     "1.00"
+#property description "Opens a long position every time the fast EMA (default 40) crosses above"
+#property description "the slow EMA (default 200). Fixed lot size, stop loss and take profit in pips,"
+#property description "with adjustable trading hours and trading days. Orders are sent via CTrade."
+
+#include <Trade\Trade.mqh>
+
+//+------------------------------------------------------------------+
+//| Inputs                                                           |
+//+------------------------------------------------------------------+
+input group "Strategy"
+input ENUM_TIMEFRAMES    InpTimeframe       = PERIOD_CURRENT;  // Signal timeframe
+input int                InpFastEMAPeriod   = 40;              // Fast EMA period
+input int                InpSlowEMAPeriod   = 200;             // Slow EMA period
+input ENUM_APPLIED_PRICE InpAppliedPrice    = PRICE_CLOSE;     // EMA applied price
+
+input group "Trade management"
+input double             InpLotSize         = 0.5;             // Lot size
+input double             InpStopLossPips    = 20.0;            // Stop loss in pips (0 = no SL)
+input double             InpTakeProfitPips  = 40.0;            // Take profit in pips (0 = no TP)
+input int                InpMaxPositions    = 0;               // Max open positions (0 = unlimited)
+input int                InpPointsPerPip    = 0;               // Points per pip (0 = auto-detect)
+input ulong              InpMagicNumber     = 402000;          // Magic number
+input uint               InpSlippagePoints  = 10;              // Max slippage (points)
+input string             InpOrderComment    = "EMA Cross EA";  // Order comment
+
+input group "Trading hours (broker server time)"
+input bool               InpUseTradingHours = true;            // Restrict trading to a time window
+input int                InpStartHour       = 8;               // Start hour (0-23)
+input int                InpStartMinute     = 0;               // Start minute (0-59)
+input int                InpEndHour         = 20;              // End hour (0-23), exclusive
+input int                InpEndMinute       = 0;               // End minute (0-59)
+
+input group "Trading days"
+input bool               InpTradeMonday     = true;            // Trade on Monday
+input bool               InpTradeTuesday    = true;            // Trade on Tuesday
+input bool               InpTradeWednesday  = true;            // Trade on Wednesday
+input bool               InpTradeThursday   = true;            // Trade on Thursday
+input bool               InpTradeFriday     = true;            // Trade on Friday
+input bool               InpTradeSaturday   = false;           // Trade on Saturday
+input bool               InpTradeSunday     = false;           // Trade on Sunday
+
+input group "Display"
+input bool               InpShowPanel       = true;            // Show info panel on chart
+
+//+------------------------------------------------------------------+
+//| Constants                                                        |
+//+------------------------------------------------------------------+
+#define EA_NAME            "EMA Crossover EA"
+#define MAX_SEND_ATTEMPTS  3      // attempts for transient errors (requote, price changed ...)
+#define RETRY_DELAY_MS     300
+#define PANEL_REFRESH_MS   1000
+
+//+------------------------------------------------------------------+
+//| Globals                                                          |
+//+------------------------------------------------------------------+
+CTrade          g_trade;
+ENUM_TIMEFRAMES g_timeframe      = PERIOD_CURRENT;
+int             g_fastHandle     = INVALID_HANDLE;
+int             g_slowHandle     = INVALID_HANDLE;
+datetime        g_lastBarTime    = 0;   // open time of the last processed signal bar
+datetime        g_lastSignalTime = 0;   // close bar time of the last detected crossover
+double          g_pipSize        = 0.0; // price distance of one pip
+double          g_lotSize        = 0.0; // lot size normalised to the symbol's volume rules
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   if(!ValidateInputs())
+      return(INIT_PARAMETERS_INCORRECT);
+
+   g_timeframe = (InpTimeframe == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpTimeframe;
+   g_pipSize   = CalculatePipSize();
+
+   g_lotSize = NormalizeVolume(InpLotSize);
+   if(g_lotSize <= 0.0)
+     {
+      PrintFormat("%s: lot size %.2f is not valid for %s", EA_NAME, InpLotSize, _Symbol);
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(MathAbs(g_lotSize - InpLotSize) > 1e-8)
+      PrintFormat("%s: lot size %.2f adjusted to %.2f to match the volume limits of %s",
+                  EA_NAME, InpLotSize, g_lotSize, _Symbol);
+
+   g_fastHandle = iMA(_Symbol, g_timeframe, InpFastEMAPeriod, 0, MODE_EMA, InpAppliedPrice);
+   g_slowHandle = iMA(_Symbol, g_timeframe, InpSlowEMAPeriod, 0, MODE_EMA, InpAppliedPrice);
+   if(g_fastHandle == INVALID_HANDLE || g_slowHandle == INVALID_HANDLE)
+     {
+      PrintFormat("%s: failed to create EMA indicator handles (error %d)", EA_NAME, GetLastError());
+      return(INIT_FAILED);
+     }
+
+   g_trade.SetExpertMagicNumber(InpMagicNumber);
+   g_trade.SetDeviationInPoints(InpSlippagePoints);
+   g_trade.SetTypeFillingBySymbol(_Symbol);
+
+//--- do not act on a crossover that completed before the EA was attached
+   g_lastBarTime = iTime(_Symbol, g_timeframe, 0);
+
+   if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING && InpMaxPositions != 1)
+      PrintFormat("%s: netting account - a new signal adds to the existing position and replaces its SL/TP",
+                  EA_NAME);
+
+   PrintFormat("%s started on %s %s | EMA %d/%d | %.2f lots | SL %.1f pips | TP %.1f pips | 1 pip = %s",
+               EA_NAME, _Symbol, TimeframeToString(g_timeframe), InpFastEMAPeriod, InpSlowEMAPeriod,
+               g_lotSize, InpStopLossPips, InpTakeProfitPips, DoubleToString(g_pipSize, _Digits));
+
+   UpdatePanel(true);
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   if(g_fastHandle != INVALID_HANDLE)
+      IndicatorRelease(g_fastHandle);
+   if(g_slowHandle != INVALID_HANDLE)
+      IndicatorRelease(g_slowHandle);
+   g_fastHandle = INVALID_HANDLE;
+   g_slowHandle = INVALID_HANDLE;
+
+   Comment("");
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick                                                      |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   CheckForSignal();
+   UpdatePanel(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Evaluates the crossover once per new bar of the signal timeframe |
+//+------------------------------------------------------------------+
+void CheckForSignal()
+  {
+   datetime barTime = iTime(_Symbol, g_timeframe, 0);
+   if(barTime == 0 || barTime == g_lastBarTime)
+      return;
+
+//--- make sure the slow EMA has enough history to be meaningful
+   if(Bars(_Symbol, g_timeframe) < InpSlowEMAPeriod + 2)
+      return;
+
+   double fast[], slow[];
+   if(!CopyEMAValues(1, 2, fast, slow))
+      return;                       // indicator not ready yet - retry on the next tick
+
+   g_lastBarTime = barTime;
+
+//--- index 0 = last closed bar, index 1 = the bar before it
+   bool crossedUp = (fast[1] <= slow[1] && fast[0] > slow[0]);
+   if(!crossedUp)
+      return;
+
+   g_lastSignalTime = iTime(_Symbol, g_timeframe, 1);
+   PrintFormat("%s: bullish crossover on bar %s (fast %s > slow %s)", EA_NAME,
+               TimeToString(g_lastSignalTime), DoubleToString(fast[0], _Digits), DoubleToString(slow[0], _Digits));
+
+   if(!IsTradingTimeAllowed(TimeCurrent()))
+     {
+      PrintFormat("%s: signal skipped - outside the configured trading hours/days", EA_NAME);
+      return;
+     }
+
+   if(InpMaxPositions > 0 && CountOpenPositions() >= InpMaxPositions)
+     {
+      PrintFormat("%s: signal skipped - maximum of %d open position(s) reached", EA_NAME, InpMaxPositions);
+      return;
+     }
+
+   if(!IsTradingPermitted())
+      return;
+
+   OpenLong();
+  }
+
+//+------------------------------------------------------------------+
+//| Opens a long position with SL/TP using CTrade                    |
+//+------------------------------------------------------------------+
+bool OpenLong()
+  {
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double margin = 0.0;
+   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, g_lotSize, ask, margin))
+     {
+      PrintFormat("%s: margin calculation failed (error %d)", EA_NAME, GetLastError());
+      return(false);
+     }
+   if(margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
+     {
+      PrintFormat("%s: not enough free margin for %.2f lots (required %.2f, free %.2f)", EA_NAME,
+                  g_lotSize, margin, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
+      return(false);
+     }
+
+   for(int attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt++)
+     {
+      MqlTick tick;
+      if(!SymbolInfoTick(_Symbol, tick))
+        {
+         PrintFormat("%s: failed to get current prices (error %d)", EA_NAME, GetLastError());
+         return(false);
+        }
+
+      double price = tick.ask;
+      double sl    = (InpStopLossPips   > 0.0) ? NormalizePrice(price - InpStopLossPips   * g_pipSize) : 0.0;
+      double tp    = (InpTakeProfitPips > 0.0) ? NormalizePrice(price + InpTakeProfitPips * g_pipSize) : 0.0;
+
+      if(!CheckStopsDistance(tick, sl, tp))
+         return(false);
+
+      bool sent    = g_trade.Buy(g_lotSize, _Symbol, price, sl, tp, InpOrderComment);
+      uint retcode = g_trade.ResultRetcode();
+      if(sent && (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL || retcode == TRADE_RETCODE_PLACED))
+        {
+         PrintFormat("%s: BUY %.2f %s @ %s | SL %s | TP %s | order #%I64u", EA_NAME,
+                     g_trade.ResultVolume(), _Symbol, DoubleToString(g_trade.ResultPrice(), _Digits),
+                     DoubleToString(sl, _Digits), DoubleToString(tp, _Digits), g_trade.ResultOrder());
+         return(true);
+        }
+
+      PrintFormat("%s: buy attempt %d/%d failed - retcode %u (%s), error %d", EA_NAME, attempt,
+                  MAX_SEND_ATTEMPTS, retcode, g_trade.ResultRetcodeDescription(), GetLastError());
+
+      if(!IsRetryableRetcode(retcode))
+         break;
+      Sleep(RETRY_DELAY_MS);
+     }
+
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Transient trade server errors that are safe to retry             |
+//+------------------------------------------------------------------+
+bool IsRetryableRetcode(const uint retcode)
+  {
+   return(retcode == TRADE_RETCODE_REQUOTE ||
+          retcode == TRADE_RETCODE_PRICE_CHANGED ||
+          retcode == TRADE_RETCODE_PRICE_OFF ||
+          retcode == TRADE_RETCODE_TOO_MANY_REQUESTS);
+  }
+
+//+------------------------------------------------------------------+
+//| Verifies SL/TP respect the broker's minimum stop distance        |
+//+------------------------------------------------------------------+
+bool CheckStopsDistance(const MqlTick &tick, const double sl, const double tp)
+  {
+   long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   if(stopsLevel <= 0)
+      return(true);
+
+   double minDistance = stopsLevel * _Point;
+//--- SL/TP of a long position are triggered by the Bid price
+   if(sl > 0.0 && tick.bid - sl < minDistance)
+     {
+      PrintFormat("%s: stop loss %s is closer than the broker minimum of %I64d points - trade skipped",
+                  EA_NAME, DoubleToString(sl, _Digits), stopsLevel);
+      return(false);
+     }
+   if(tp > 0.0 && tp - tick.bid < minDistance)
+     {
+      PrintFormat("%s: take profit %s is closer than the broker minimum of %I64d points - trade skipped",
+                  EA_NAME, DoubleToString(tp, _Digits), stopsLevel);
+      return(false);
+     }
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Checks terminal, account and symbol permissions                  |
+//+------------------------------------------------------------------+
+bool IsTradingPermitted()
+  {
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+     {
+      PrintFormat("%s: trade skipped - Algo Trading is disabled in the terminal", EA_NAME);
+      return(false);
+     }
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+     {
+      PrintFormat("%s: trade skipped - Algo Trading is disabled in the EA properties", EA_NAME);
+      return(false);
+     }
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) || !AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+     {
+      PrintFormat("%s: trade skipped - automated trading is not allowed on this account", EA_NAME);
+      return(false);
+     }
+   ENUM_SYMBOL_TRADE_MODE mode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+   if(mode != SYMBOL_TRADE_MODE_FULL && mode != SYMBOL_TRADE_MODE_LONGONLY)
+     {
+      PrintFormat("%s: trade skipped - long trades are not allowed on %s", EA_NAME, _Symbol);
+      return(false);
+     }
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Trading day and time window filter                               |
+//+------------------------------------------------------------------+
+bool IsTradingTimeAllowed(const datetime time)
+  {
+   MqlDateTime dt;
+   TimeToStruct(time, dt);
+
+   if(!IsTradingDay(dt.day_of_week))
+      return(false);
+   if(!InpUseTradingHours)
+      return(true);
+
+   int now   = dt.hour * 60 + dt.min;
+   int start = InpStartHour * 60 + InpStartMinute;
+   int end   = InpEndHour * 60 + InpEndMinute;
+
+   if(start == end)                 // identical start and end = whole day
+      return(true);
+   if(start < end)                  // e.g. 08:00 - 20:00
+      return(now >= start && now < end);
+   return(now >= start || now < end); // window wraps past midnight, e.g. 22:00 - 04:00
+  }
+
+//+------------------------------------------------------------------+
+bool IsTradingDay(const int dayOfWeek)
+  {
+   switch(dayOfWeek)
+     {
+      case 0:
+         return(InpTradeSunday);
+      case 1:
+         return(InpTradeMonday);
+      case 2:
+         return(InpTradeTuesday);
+      case 3:
+         return(InpTradeWednesday);
+      case 4:
+         return(InpTradeThursday);
+      case 5:
+         return(InpTradeFriday);
+      case 6:
+         return(InpTradeSaturday);
+     }
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Number of open positions of this EA on the current symbol        |
+//+------------------------------------------------------------------+
+int CountOpenPositions()
+  {
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(PositionGetTicket(i) == 0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         PositionGetInteger(POSITION_MAGIC) == (long)InpMagicNumber)
+         count++;
+     }
+   return(count);
+  }
+
+//+------------------------------------------------------------------+
+//| Copies EMA values; arrays are indexed as series (0 = newest)     |
+//+------------------------------------------------------------------+
+bool CopyEMAValues(const int startPos, const int count, double &fast[], double &slow[])
+  {
+   if(BarsCalculated(g_fastHandle) < startPos + count || BarsCalculated(g_slowHandle) < startPos + count)
+      return(false);
+
+   ArraySetAsSeries(fast, true);
+   ArraySetAsSeries(slow, true);
+   return(CopyBuffer(g_fastHandle, 0, startPos, count, fast) == count &&
+          CopyBuffer(g_slowHandle, 0, startPos, count, slow) == count);
+  }
+
+//+------------------------------------------------------------------+
+//| Pip size: 10 points on 3/5 digit quotes, otherwise 1 point       |
+//+------------------------------------------------------------------+
+double CalculatePipSize()
+  {
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(InpPointsPerPip > 0)
+      return(point * InpPointsPerPip);
+
+   long digits = SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   return((digits == 3 || digits == 5) ? point * 10.0 : point);
+  }
+
+//+------------------------------------------------------------------+
+//| Rounds a price to the symbol's tick size                         |
+//+------------------------------------------------------------------+
+double NormalizePrice(const double price)
+  {
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize > 0.0)
+      return(NormalizeDouble(MathRound(price / tickSize) * tickSize, _Digits));
+   return(NormalizeDouble(price, _Digits));
+  }
+
+//+------------------------------------------------------------------+
+//| Rounds a volume down to the volume step within min/max limits    |
+//+------------------------------------------------------------------+
+double NormalizeVolume(const double volume)
+  {
+   double minVolume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxVolume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step      = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0.0)
+      return(0.0);
+
+   double normalized = MathFloor(volume / step + 1e-9) * step;
+   normalized = MathMax(minVolume, MathMin(maxVolume, normalized));
+
+   int volumeDigits = (int)MathMax(0.0, MathCeil(-MathLog10(step)));
+   return(NormalizeDouble(normalized, volumeDigits));
+  }
+
+//+------------------------------------------------------------------+
+//| Input validation                                                 |
+//+------------------------------------------------------------------+
+bool ValidateInputs()
+  {
+   bool ok = true;
+
+   if(InpFastEMAPeriod < 1 || InpSlowEMAPeriod < 1)
+     {
+      Print(EA_NAME, ": EMA periods must be at least 1");
+      ok = false;
+     }
+   else
+      if(InpFastEMAPeriod >= InpSlowEMAPeriod)
+        {
+         Print(EA_NAME, ": fast EMA period must be smaller than slow EMA period");
+         ok = false;
+        }
+   if(InpLotSize <= 0.0)
+     {
+      Print(EA_NAME, ": lot size must be greater than 0");
+      ok = false;
+     }
+   if(InpStopLossPips < 0.0 || InpTakeProfitPips < 0.0)
+     {
+      Print(EA_NAME, ": stop loss and take profit cannot be negative");
+      ok = false;
+     }
+   if(InpMaxPositions < 0)
+     {
+      Print(EA_NAME, ": max open positions cannot be negative");
+      ok = false;
+     }
+   if(InpPointsPerPip < 0)
+     {
+      Print(EA_NAME, ": points per pip cannot be negative");
+      ok = false;
+     }
+   if(InpStartHour < 0 || InpStartHour > 23 || InpEndHour < 0 || InpEndHour > 23 ||
+      InpStartMinute < 0 || InpStartMinute > 59 || InpEndMinute < 0 || InpEndMinute > 59)
+     {
+      Print(EA_NAME, ": trading hours must be 0-23 and minutes 0-59");
+      ok = false;
+     }
+   if(!InpTradeMonday && !InpTradeTuesday && !InpTradeWednesday && !InpTradeThursday &&
+      !InpTradeFriday && !InpTradeSaturday && !InpTradeSunday)
+     {
+      Print(EA_NAME, ": at least one trading day must be enabled");
+      ok = false;
+     }
+
+   return(ok);
+  }
+
+//+------------------------------------------------------------------+
+//| On-chart information panel                                       |
+//+------------------------------------------------------------------+
+void UpdatePanel(const bool force)
+  {
+   if(!InpShowPanel)
+      return;
+   if(MQLInfoInteger(MQL_TESTER) && !MQLInfoInteger(MQL_VISUAL_MODE))
+      return;
+
+   static uint lastUpdate = 0;
+   uint now = GetTickCount();
+   if(!force && now - lastUpdate < PANEL_REFRESH_MS)
+      return;
+   lastUpdate = now;
+
+   string emaLine = "EMA data loading...";
+   double fast[], slow[];
+   if(CopyEMAValues(0, 1, fast, slow))
+      emaLine = StringFormat("Fast EMA(%d): %s   Slow EMA(%d): %s   (%s)",
+                             InpFastEMAPeriod, DoubleToString(fast[0], _Digits),
+                             InpSlowEMAPeriod, DoubleToString(slow[0], _Digits),
+                             fast[0] > slow[0] ? "fast above slow" : "fast below slow");
+
+   string status = IsTradingTimeAllowed(TimeCurrent()) ? "ACTIVE" : "PAUSED (outside trading hours/days)";
+   string lastSignal = (g_lastSignalTime > 0) ? TimeToString(g_lastSignalTime) : "none since start";
+
+   string text = StringFormat("%s  |  %s %s\n", EA_NAME, _Symbol, TimeframeToString(g_timeframe));
+   text += emaLine + "\n";
+   text += StringFormat("Lots: %.2f   SL: %.1f pips   TP: %.1f pips   Magic: %I64u\n",
+                        g_lotSize, InpStopLossPips, InpTakeProfitPips, InpMagicNumber);
+   text += "Schedule: " + ScheduleDescription() + "\n";
+   text += "Status: " + status + "\n";
+   text += StringFormat("Open positions: %d   Last crossover: %s", CountOpenPositions(), lastSignal);
+
+   Comment(text);
+  }
+
+//+------------------------------------------------------------------+
+string ScheduleDescription()
+  {
+   string hours = InpUseTradingHours
+                  ? StringFormat("%02d:%02d-%02d:%02d server time", InpStartHour, InpStartMinute, InpEndHour, InpEndMinute)
+                  : "24h";
+   string days = "";
+   if(InpTradeMonday)
+      days += " Mon";
+   if(InpTradeTuesday)
+      days += " Tue";
+   if(InpTradeWednesday)
+      days += " Wed";
+   if(InpTradeThursday)
+      days += " Thu";
+   if(InpTradeFriday)
+      days += " Fri";
+   if(InpTradeSaturday)
+      days += " Sat";
+   if(InpTradeSunday)
+      days += " Sun";
+   return(hours + " |" + days);
+  }
+
+//+------------------------------------------------------------------+
+string TimeframeToString(const ENUM_TIMEFRAMES timeframe)
+  {
+   return(StringSubstr(EnumToString(timeframe), 7)); // strip "PERIOD_"
+  }
+//+------------------------------------------------------------------+
