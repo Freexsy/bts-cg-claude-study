@@ -70,9 +70,11 @@ Try: *"Show me my MetaTrader account and the EURUSD price."*
 If `pip` says that no version of `MetaTrader5` matches, your Python is too recent for the MetaTrader5
 package. Install Python 3.12 or 3.13 as well, and use `py -3.12` or `py -3.13` instead of `py` in steps 3 and 4.
 
-## Testing without MetaTrader
+## Testing
 
-The `MetaTrader5` package only works on Windows. The server was smoke-tested end to end over stdio against
-a fake `MetaTrader5` module. That test covered the tool list, the read tools, and opening, modifying and
-closing a position. It also covered each refusal: lots above the limit, a missing stop loss, a stop loss on
-the wrong side, risk above the limit, and a real account.
+- **Without MetaTrader:** the `MetaTrader5` package only works on Windows. The server was smoke-tested end to end
+  over stdio against a fake `MetaTrader5` module. That test covered the tool list, the read tools, and opening,
+  modifying and closing a position. It also covered each refusal: lots above the limit, a missing stop loss, a
+  stop loss on the wrong side, risk above the limit, and a real account.
+- **With MetaTrader:** verified from Claude Desktop on a MetaQuotes-Demo account (Python 3.14, MetaTrader5 5.0.6180):
+  reading the account, then opening, modifying and closing a 0.01 lot EURUSD position.
