@@ -48,15 +48,28 @@ TIMEFRAMES = {
 }
 Timeframe = Literal["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"]
 Side = Literal["buy", "sell"]
+PendingType = Literal["buy_limit", "sell_limit", "buy_stop", "sell_stop"]
+PENDING_TYPES = {
+    "buy_limit": mt5.ORDER_TYPE_BUY_LIMIT,
+    "sell_limit": mt5.ORDER_TYPE_SELL_LIMIT,
+    "buy_stop": mt5.ORDER_TYPE_BUY_STOP,
+    "sell_stop": mt5.ORDER_TYPE_SELL_STOP,
+}
+PENDING_NAMES = {code: name for name, code in PENDING_TYPES.items()}
+RETCODE_INVALID_FILL = 10030   # the broker does not accept this filling type
+EXPIRATION_SPECIFIED_FLAG = 4  # symbol_info().expiration_mode bit: expiry at a given time allowed
 
 INSTRUCTIONS = """\
 Tools to read and trade the MetaTrader 5 account open on the user's computer.
 - Before proposing a trade, call get_account_info and get_price, and size the position with
   calculate_lot_size instead of computing lots yourself.
-- Before calling open_position, modify_position or close_position, show the user the exact trade
-  (symbol, side, lots, entry, stop loss, take profit, money at risk) and wait for an explicit yes.
+- For technical analysis, use get_indicators instead of estimating indicators from raw candles.
+- Before calling any trading tool (open_position, place_pending_order, modify_position,
+  close_position, cancel_pending_order), show the user the exact order (symbol, side, lots, entry,
+  stop loss, take profit, money at risk) and wait for an explicit yes.
 - The server enforces safety limits (demo account only unless allowed, max lots, max risk per trade,
-  max open positions, mandatory stop loss). Never try to work around a refusal; explain it instead.
+  max open positions and pending orders, mandatory stop loss). Never try to work around a refusal;
+  explain it instead.
 - Candle and price times are in the broker's server time.
 - Be honest about uncertainty: no analysis guarantees a profit.
 """
@@ -172,26 +185,61 @@ def _loss_at_stop(side: Side, symbol: str, volume: float, price: float, stop_los
     return -profit
 
 
-def _check_levels(side: Side, info: Any, price: float, stop_loss: float, take_profit: float) -> None:
+def _check_levels(side: Side, info: Any, price: float, stop_loss: float, take_profit: float,
+                  reference: str = "current price") -> None:
     """Checks that SL and TP are on the correct side of price and far enough from it."""
     if stop_loss <= 0:
         _refuse("A stop loss is required on every position.")
     if side == "buy" and stop_loss >= price:
-        _refuse(f"For a buy, the stop loss must be below the current price ({price}).")
+        _refuse(f"For a buy, the stop loss must be below the {reference} ({price}).")
     if side == "sell" and stop_loss <= price:
-        _refuse(f"For a sell, the stop loss must be above the current price ({price}).")
+        _refuse(f"For a sell, the stop loss must be above the {reference} ({price}).")
     if take_profit and side == "buy" and take_profit <= price:
-        _refuse(f"For a buy, the take profit must be above the current price ({price}).")
+        _refuse(f"For a buy, the take profit must be above the {reference} ({price}).")
     if take_profit and side == "sell" and take_profit >= price:
-        _refuse(f"For a sell, the take profit must be below the current price ({price}).")
+        _refuse(f"For a sell, the take profit must be below the {reference} ({price}).")
 
     min_distance = info.trade_stops_level * info.point
     if abs(price - stop_loss) < min_distance or (take_profit and abs(take_profit - price) < min_distance):
-        _refuse(f"Stop loss and take profit must be at least {info.trade_stops_level} points from the price.")
+        _refuse(f"Stop loss and take profit must be at least {info.trade_stops_level} points from the {reference}.")
+
+
+def _check_new_order(info: Any, symbol: str, side: Side, volume: float) -> float:
+    """Checks the symbol, the volume and the number of open trades; returns the normalised volume."""
+    allowed_modes = {mt5.SYMBOL_TRADE_MODE_FULL,
+                     mt5.SYMBOL_TRADE_MODE_LONGONLY if side == "buy" else mt5.SYMBOL_TRADE_MODE_SHORTONLY}
+    if info.trade_mode not in allowed_modes:
+        _refuse(f"{side} trades are not allowed on {symbol} right now.")
+
+    volume = _normalize_volume(info, volume)
+    if volume < info.volume_min:
+        _refuse(f"Volume below the minimum of {info.volume_min} lots for {symbol}.")
+    if volume > MAX_LOTS:
+        _refuse(f"{volume} lots is above the limit of {MAX_LOTS} lots per order.")
+
+    open_trades = mt5.positions_total() + mt5.orders_total()
+    if open_trades >= MAX_OPEN_POSITIONS:
+        _refuse(f"{open_trades} positions and pending orders are already open; the limit is {MAX_OPEN_POSITIONS}.")
+    return volume
+
+
+def _check_risk(account: Any, side: Side, symbol: str, volume: float, entry: float, stop_loss: float) -> tuple[float, float]:
+    """Refuses a trade that would lose more than the max risk at its stop loss."""
+    risk_money = _loss_at_stop(side, symbol, volume, entry, stop_loss)
+    risk_percent = risk_money / account.balance * 100
+    if risk_percent > MAX_RISK_PERCENT + 1e-9:
+        _refuse(f"This trade risks {risk_money:.2f} {account.currency} ({risk_percent:.2f} % of the balance), "
+                f"above the limit of {MAX_RISK_PERCENT} %. Use calculate_lot_size to size it.")
+    return risk_money, risk_percent
 
 
 def _send(request: dict[str, Any], action: str) -> Any:
     result = mt5.order_send(request)
+    if (result is not None and result.retcode == RETCODE_INVALID_FILL
+            and request.get("type_filling") != mt5.ORDER_FILLING_RETURN):
+        # some brokers only accept the "return" filling type, notably for pending orders
+        request = {**request, "type_filling": mt5.ORDER_FILLING_RETURN}
+        result = mt5.order_send(request)
     if result is None:
         raise ToolError(f"{action}: order not sent ({mt5.last_error()}).")
     if result.retcode != mt5.TRADE_RETCODE_DONE:
@@ -218,6 +266,71 @@ def _position_dict(position: Any) -> dict[str, Any]:
     }
 
 
+def _order_dict(order: Any) -> dict[str, Any]:
+    return {
+        "ticket": order.ticket,
+        "symbol": order.symbol,
+        "type": PENDING_NAMES.get(order.type, str(order.type)),
+        "volume": order.volume_current,
+        "price": order.price_open,
+        "stop_loss": order.sl,
+        "take_profit": order.tp,
+        "placed": _server_time(order.time_setup),
+        "expires": _server_time(order.time_expiration) if order.time_expiration else "when cancelled",
+        "placed_by_claude": order.magic == MAGIC_NUMBER,
+        "comment": order.comment,
+    }
+
+
+# ── Indicators (computed on closed candles, oldest first) ───────────
+
+
+def _ema(values: list[float], period: int) -> list[float]:
+    """Exponential moving average seeded with the simple average of the first `period` values.
+    The result starts at index period - 1 of `values`."""
+    if len(values) < period:
+        return []
+    alpha = 2 / (period + 1)
+    result = [sum(values[:period]) / period]
+    for value in values[period:]:
+        result.append(alpha * value + (1 - alpha) * result[-1])
+    return result
+
+
+def _rsi(closes: list[float], period: int = 14) -> float | None:
+    """Relative Strength Index with Wilder's smoothing."""
+    if len(closes) <= period:
+        return None
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    avg_gain = sum(max(c, 0.0) for c in changes[:period]) / period
+    avg_loss = sum(max(-c, 0.0) for c in changes[:period]) / period
+    for change in changes[period:]:
+        avg_gain = (avg_gain * (period - 1) + max(change, 0.0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-change, 0.0)) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_gain / avg_loss)
+
+
+def _atr(highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> float | None:
+    """Average True Range with Wilder's smoothing."""
+    if len(closes) <= period:
+        return None
+    ranges = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+              for i in range(1, len(closes))]
+    atr = sum(ranges[:period]) / period
+    for true_range in ranges[period:]:
+        atr = (atr * (period - 1) + true_range) / period
+    return atr
+
+
+def _bollinger(closes: list[float], period: int = 20, width: float = 2.0) -> tuple[float, float, float]:
+    window = closes[-period:]
+    middle = sum(window) / period
+    deviation = math.sqrt(sum((c - middle) ** 2 for c in window) / period)
+    return middle + width * deviation, middle, middle - width * deviation
+
+
 # ── Read-only tools ─────────────────────────────────────────────────
 
 
@@ -237,10 +350,11 @@ def get_account_info() -> dict[str, Any]:
         "free_margin": account.margin_free,
         "leverage": account.leverage,
         "open_positions": mt5.positions_total(),
+        "pending_orders": mt5.orders_total(),
         "safety_limits": {
             "real_account_trading_allowed": ALLOW_REAL_ACCOUNT,
             "max_lots_per_order": MAX_LOTS,
-            "max_open_positions": MAX_OPEN_POSITIONS,
+            "max_open_positions_and_pending_orders": MAX_OPEN_POSITIONS,
             "max_risk_percent_per_trade": MAX_RISK_PERCENT,
             "stop_loss_required": True,
         },
@@ -288,6 +402,65 @@ def get_candles(symbol: str, timeframe: Timeframe = "H1", count: int = 100) -> d
         for rate in rates
     ]
     return {"symbol": symbol, "timeframe": timeframe, "time_zone": "broker server time", "candles": candles}
+
+
+@server.tool(annotations=READ_ONLY)
+def get_indicators(symbol: str, timeframe: Timeframe = "H1") -> dict[str, Any]:
+    """Common indicators on the last CLOSED candle of a symbol: EMA 20/50/200, RSI 14, ATR 14,
+    MACD 12/26/9, Bollinger Bands 20/2, and the highest high / lowest low of the last 20 candles.
+    Use these values instead of estimating indicators from raw candles."""
+    info = _symbol(symbol)
+    # start at 1 to skip the candle that is still forming
+    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[timeframe], 1, 600)
+    if rates is None or len(rates) < 210:
+        raise ToolError(f"Not enough history for {symbol} {timeframe}: 210 closed candles are needed.")
+
+    closes = [float(r["close"]) for r in rates]
+    highs = [float(r["high"]) for r in rates]
+    lows = [float(r["low"]) for r in rates]
+    digits = info.digits
+
+    macd_line = [fast - slow for fast, slow in zip(_ema(closes, 12)[14:], _ema(closes, 26))]
+    macd_signal = _ema(macd_line, 9)
+    upper, middle, lower = _bollinger(closes)
+    atr = _atr(highs, lows, closes)
+    rsi = _rsi(closes)
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candle_time": _server_time(int(rates[-1]["time"])),
+        "close": closes[-1],
+        "ema_20": round(_ema(closes, 20)[-1], digits),
+        "ema_50": round(_ema(closes, 50)[-1], digits),
+        "ema_200": round(_ema(closes, 200)[-1], digits),
+        "rsi_14": round(rsi, 1) if rsi is not None else None,
+        "atr_14": round(atr, digits) if atr is not None else None,
+        "atr_14_pips": round(atr / _pip_size(info), 1) if atr is not None else None,
+        "macd_12_26_9": {
+            "line": round(macd_line[-1], digits + 2),
+            "signal": round(macd_signal[-1], digits + 2),
+            "histogram": round(macd_line[-1] - macd_signal[-1], digits + 2),
+        },
+        "bollinger_20_2": {
+            "upper": round(upper, digits),
+            "middle": round(middle, digits),
+            "lower": round(lower, digits),
+        },
+        "highest_high_20": max(highs[-20:]),
+        "lowest_low_20": min(lows[-20:]),
+        "time_zone": "broker server time",
+    }
+
+
+@server.tool(annotations=READ_ONLY)
+def get_pending_orders(symbol: str | None = None) -> dict[str, Any]:
+    """Pending orders (limit and stop orders not filled yet), optionally for one symbol only."""
+    _connect()
+    orders = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
+    if orders is None:
+        raise ToolError(f"Cannot read the pending orders ({mt5.last_error()}).")
+    return {"count": len(orders), "orders": [_order_dict(o) for o in orders]}
 
 
 @server.tool(annotations=READ_ONLY)
@@ -340,14 +513,21 @@ def get_trade_history(days: int = 7) -> dict[str, Any]:
 
 
 @server.tool(annotations=READ_ONLY)
-def calculate_lot_size(symbol: str, side: Side, stop_loss: float, risk_percent: float = 1.0) -> dict[str, Any]:
-    """Lot size so that hitting stop_loss from the current price loses risk_percent of the balance.
+def calculate_lot_size(
+    symbol: str, side: Side, stop_loss: float, risk_percent: float = 1.0, entry_price: float = 0.0
+) -> dict[str, Any]:
+    """Lot size so that hitting stop_loss from the entry loses risk_percent of the balance.
+    entry_price 0 = the current price (market order); set it to the order price for a pending order.
     The risk is capped by this server's max risk per trade and the lots by its max lots per order."""
     account = _account()
     info = _symbol(symbol)
-    tick = _tick(symbol)
-    price = tick.ask if side == "buy" else tick.bid
-    _check_levels(side, info, price, stop_loss, 0.0)
+    if entry_price > 0:
+        price = round(entry_price, info.digits)
+        _check_levels(side, info, price, stop_loss, 0.0, "entry price")
+    else:
+        tick = _tick(symbol)
+        price = tick.ask if side == "buy" else tick.bid
+        _check_levels(side, info, price, stop_loss, 0.0)
 
     loss_per_lot = _loss_at_stop(side, symbol, 1.0, price, stop_loss)
     if loss_per_lot <= 0:
@@ -392,32 +572,14 @@ def open_position(
     above the lot, risk or open position limits, or with an invalid stop loss or take profit."""
     account = _trading_account()
     info = _symbol(symbol)
-
-    allowed_modes = {mt5.SYMBOL_TRADE_MODE_FULL, mt5.SYMBOL_TRADE_MODE_LONGONLY if side == "buy" else mt5.SYMBOL_TRADE_MODE_SHORTONLY}
-    if info.trade_mode not in allowed_modes:
-        _refuse(f"{side} trades are not allowed on {symbol} right now.")
-
-    volume = _normalize_volume(info, volume)
-    if volume < info.volume_min:
-        _refuse(f"Volume below the minimum of {info.volume_min} lots for {symbol}.")
-    if volume > MAX_LOTS:
-        _refuse(f"{volume} lots is above the limit of {MAX_LOTS} lots per order.")
-
-    open_positions = mt5.positions_total()
-    if open_positions >= MAX_OPEN_POSITIONS:
-        _refuse(f"{open_positions} positions are already open; the limit is {MAX_OPEN_POSITIONS}.")
+    volume = _check_new_order(info, symbol, side, volume)
 
     tick = _tick(symbol)
     price = tick.ask if side == "buy" else tick.bid
     stop_loss = round(stop_loss, info.digits)
     take_profit = round(take_profit, info.digits) if take_profit else 0.0
     _check_levels(side, info, price, stop_loss, take_profit)
-
-    risk_money = _loss_at_stop(side, symbol, volume, price, stop_loss)
-    risk_percent = risk_money / account.balance * 100
-    if risk_percent > MAX_RISK_PERCENT + 1e-9:
-        _refuse(f"This trade risks {risk_money:.2f} {account.currency} ({risk_percent:.2f} % of the balance), "
-                f"above the limit of {MAX_RISK_PERCENT} %. Use calculate_lot_size to size it.")
+    risk_money, risk_percent = _check_risk(account, side, symbol, volume, price, stop_loss)
 
     result = _send(
         {
@@ -451,6 +613,92 @@ def open_position(
         "risk_money": round(risk_money, 2),
         "risk_percent": round(risk_percent, 2),
     }
+
+
+@server.tool(annotations=TRADING)
+def place_pending_order(
+    symbol: str,
+    order_type: PendingType,
+    volume: float,
+    price: float,
+    stop_loss: float,
+    take_profit: float = 0.0,
+    expiration_hours: float = 0.0,
+    comment: str = "Claude MCP",
+) -> dict[str, Any]:
+    """Places a pending order with a mandatory stop loss: buy_limit below the current price,
+    sell_limit above it, buy_stop above it, sell_stop below it. take_profit 0 = none,
+    expiration_hours 0 = until cancelled. Only call it after the user has explicitly approved this
+    exact order. The same safety limits as open_position apply, with the risk measured from price."""
+    account = _trading_account()
+    info = _symbol(symbol)
+    side: Side = "buy" if order_type.startswith("buy") else "sell"
+    volume = _check_new_order(info, symbol, side, volume)
+
+    tick = _tick(symbol)
+    market = tick.ask if side == "buy" else tick.bid
+    price = round(price, info.digits)
+    must_be_below = order_type in ("buy_limit", "sell_stop")
+    if (must_be_below and price >= market) or (not must_be_below and price <= market):
+        _refuse(f"A {order_type} must be {'below' if must_be_below else 'above'} the current price ({market}).")
+    if abs(price - market) < info.trade_stops_level * info.point:
+        _refuse(f"The order price must be at least {info.trade_stops_level} points from the current price.")
+
+    stop_loss = round(stop_loss, info.digits)
+    take_profit = round(take_profit, info.digits) if take_profit else 0.0
+    _check_levels(side, info, price, stop_loss, take_profit, "order price")
+    risk_money, risk_percent = _check_risk(account, side, symbol, volume, price, stop_loss)
+
+    request: dict[str, Any] = {
+        "action": mt5.TRADE_ACTION_PENDING,
+        "symbol": symbol,
+        "volume": volume,
+        "type": PENDING_TYPES[order_type],
+        "price": price,
+        "sl": stop_loss,
+        "tp": take_profit,
+        "deviation": DEVIATION_POINTS,
+        "magic": MAGIC_NUMBER,
+        "comment": comment[:31],
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": _filling_type(info),
+    }
+    if expiration_hours > 0:
+        if not info.expiration_mode & EXPIRATION_SPECIFIED_FLAG:
+            _refuse(f"The broker does not accept an expiration time on {symbol}. "
+                    "Use expiration_hours = 0 and cancel the order later.")
+        request["type_time"] = mt5.ORDER_TIME_SPECIFIED
+        request["expiration"] = int(tick.time + expiration_hours * 3600)
+
+    result = _send(request, "Place pending order")
+    log.info("PENDING %s %s %.2f lots @ %s SL %s TP %s risk %.2f %s (%.2f %%) ticket %s",
+             order_type, symbol, volume, price, stop_loss, take_profit, risk_money, account.currency,
+             risk_percent, result.order)
+    return {
+        "status": "placed",
+        "ticket": result.order,
+        "symbol": symbol,
+        "type": order_type,
+        "volume": volume,
+        "price": price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "expires": _server_time(request["expiration"]) if "expiration" in request else "when cancelled",
+        "risk_money": round(risk_money, 2),
+        "risk_percent": round(risk_percent, 2),
+    }
+
+
+@server.tool(annotations=TRADING)
+def cancel_pending_order(ticket: int) -> dict[str, Any]:
+    """Cancels a pending order. Only call it after the user has explicitly approved it."""
+    _trading_account()
+    orders = mt5.orders_get(ticket=ticket)
+    if not orders:
+        raise ToolError(f"No pending order with ticket {ticket}.")
+    _send({"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}, "Cancel pending order")
+    log.info("CANCEL pending order #%s %s", ticket, orders[0].symbol)
+    return {"status": "cancelled", "ticket": ticket, "symbol": orders[0].symbol}
 
 
 @server.tool(annotations=TRADING)

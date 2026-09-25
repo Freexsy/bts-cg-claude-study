@@ -14,14 +14,19 @@ automated trading, use an Expert Advisor.
 | `get_account_info` | Balance, equity, free margin, leverage, demo or real, and the safety limits |
 | `get_price` | Bid, ask, spread and trading specifications of a symbol |
 | `get_candles` | The latest candles of a symbol (M1 to MN1, up to 500) |
+| `get_indicators` | EMA 20/50/200, RSI 14, ATR 14, MACD 12/26/9, Bollinger 20/2 and the 20-candle high/low, on the last closed candle |
 | `get_positions` | Open positions with SL, TP and floating profit |
+| `get_pending_orders` | Pending limit and stop orders |
 | `get_trade_history` | Trades closed during the last N days, with wins, losses and net result |
-| `calculate_lot_size` | The lot size that risks a given % of the balance at a given stop loss |
+| `calculate_lot_size` | The lot size that risks a given % of the balance at a given stop loss, from the current price or from a pending order price |
 | `open_position` | Opens a market position (stop loss required) |
+| `place_pending_order` | Places a buy/sell limit or stop order (stop loss required, optional expiry) |
 | `modify_position` | Changes the SL/TP of an open position |
 | `close_position` | Closes an open position |
+| `cancel_pending_order` | Cancels a pending order |
 
-The three trading tools are marked as destructive, so Claude Desktop asks for your approval before each call.
+The five trading tools are marked as destructive, so Claude Desktop asks for your approval before each call.
+If the broker rejects the filling type of an order, the server retries once with the "return" filling type.
 
 ## Safety limits
 
@@ -31,8 +36,8 @@ The server enforces these limits on every order and refuses the order when a lim
 |---|---|---|
 | Trade demo accounts only | on | `MT5_ALLOW_REAL_ACCOUNT` (`true` to allow real accounts) |
 | Max lots per order | 0.10 | `MT5_MAX_LOTS` |
-| Max open positions (whole account) | 3 | `MT5_MAX_OPEN_POSITIONS` |
-| Max risk per trade (% of balance, at the SL) | 1.0 | `MT5_MAX_RISK_PERCENT` |
+| Max open positions + pending orders (whole account) | 3 | `MT5_MAX_OPEN_POSITIONS` |
+| Max risk per trade (% of balance, from the entry to the SL) | 1.0 | `MT5_MAX_RISK_PERCENT` |
 | Stop loss required, on the correct side, and it can't be moved beyond the max risk | always | |
 
 Other settings:
@@ -73,8 +78,14 @@ package. Install Python 3.12 or 3.13 as well, and use `py -3.12` or `py -3.13` i
 ## Testing
 
 - **Without MetaTrader:** the `MetaTrader5` package only works on Windows. The server was smoke-tested end to end
-  over stdio against a fake `MetaTrader5` module. That test covered the tool list, the read tools, and opening,
-  modifying and closing a position. It also covered each refusal: lots above the limit, a missing stop loss, a
-  stop loss on the wrong side, risk above the limit, and a real account.
+  over stdio against a fake `MetaTrader5` module (33 checks). The checks cover:
+  - the tool list and the read tools, including the indicators;
+  - opening, modifying and closing a position;
+  - placing, listing and cancelling pending orders;
+  - each refusal: lots above the limit, a missing stop loss, a stop loss on the wrong side, a limit order on the
+    wrong side of the price, risk above the limit, too many open trades, an unsupported expiry, and a real account.
+
+  The indicator functions also have unit checks. For example, the RSI of a hand-computed series is 70.46.
 - **With MetaTrader:** verified from Claude Desktop on a MetaQuotes-Demo account (Python 3.14, MetaTrader5 5.0.6180):
-  reading the account, then opening, modifying and closing a 0.01 lot EURUSD position.
+  reading the account, then opening, modifying and closing a 0.01 lot EURUSD position. The indicator and
+  pending order tools were added afterwards and have only been tested against the fake module so far.

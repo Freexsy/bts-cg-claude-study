@@ -194,6 +194,7 @@ backtest the idea in TradingView's Strategy Tester and see the signals on any ch
 ## MetaTrader 5 MCP server (Claude Desktop)
 
 `mt5-mcp-server/` contains an MCP server. With it, Claude Desktop can read a MetaTrader 5 account
-(account, prices, candles, positions, history) and, after your approval, open, modify and close positions.
+(account, prices, candles, indicators, positions, pending orders, history). After your approval, it can open,
+modify and close positions and place or cancel pending orders.
 The server enforces safety limits: demo account only, max lots, max risk per trade, max open positions and a
 mandatory stop loss. See `mt5-mcp-server/README.md` for the installation.
