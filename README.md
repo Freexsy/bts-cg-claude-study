@@ -190,3 +190,10 @@ backtest the idea in TradingView's Strategy Tester and see the signals on any ch
   1 pip per round trip on EURUSD. Adjust it for other markets.
 - A TradingView strategy does not place real orders. Automated trading needs alerts sent by
   webhook (paid plan) to a broker or a bridge.
+
+## MetaTrader 5 MCP server (Claude Desktop)
+
+`mt5-mcp-server/` contains an MCP server. With it, Claude Desktop can read a MetaTrader 5 account
+(account, prices, candles, positions, history) and, after your approval, open, modify and close positions.
+The server enforces safety limits: demo account only, max lots, max risk per trade, max open positions and a
+mandatory stop loss. See `mt5-mcp-server/README.md` for the installation.

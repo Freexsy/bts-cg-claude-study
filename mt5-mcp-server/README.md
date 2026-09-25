@@ -1,0 +1,69 @@
+# MetaTrader 5 MCP server
+
+`mt5_mcp_server.py` is an MCP server that lets Claude Desktop read and trade a MetaTrader 5 account.
+It runs on the Windows PC where the MetaTrader 5 terminal is installed. It connects to the terminal with
+the official `MetaTrader5` Python package.
+
+Claude only acts when you send it a message. It does not watch the market on its own. For continuous
+automated trading, use an Expert Advisor.
+
+## Tools
+
+| Tool | What it does |
+|---|---|
+| `get_account_info` | Balance, equity, free margin, leverage, demo or real, and the safety limits |
+| `get_price` | Bid, ask, spread and trading specifications of a symbol |
+| `get_candles` | The latest candles of a symbol (M1 to MN1, up to 500) |
+| `get_positions` | Open positions with SL, TP and floating profit |
+| `get_trade_history` | Trades closed during the last N days, with wins, losses and net result |
+| `calculate_lot_size` | The lot size that risks a given % of the balance at a given stop loss |
+| `open_position` | Opens a market position (stop loss required) |
+| `modify_position` | Changes the SL/TP of an open position |
+| `close_position` | Closes an open position |
+
+The three trading tools are marked as destructive, so Claude Desktop asks for your approval before each call.
+
+## Safety limits
+
+The server enforces these limits on every order and refuses the order when a limit is not met.
+
+| Limit | Default | Environment variable |
+|---|---|---|
+| Trade demo accounts only | on | `MT5_ALLOW_REAL_ACCOUNT` (`true` to allow real accounts) |
+| Max lots per order | 0.10 | `MT5_MAX_LOTS` |
+| Max open positions (whole account) | 3 | `MT5_MAX_OPEN_POSITIONS` |
+| Max risk per trade (% of balance, at the SL) | 1.0 | `MT5_MAX_RISK_PERCENT` |
+| Stop loss required, on the correct side, and it can't be moved beyond the max risk | always | |
+
+Other settings:
+- `MT5_MAGIC`: the magic number of Claude's orders, 404000 by default.
+- `MT5_DEVIATION_POINTS`: the maximum slippage in points, 20 by default.
+- `MT5_TERMINAL_PATH`: the path to `terminal64.exe`, if several terminals are installed.
+- `MT5_LOG_FILE`: the path of the log file.
+
+Every order and every refusal is written to `mt5_mcp_actions.log`, next to the script.
+
+## Installation (Windows)
+
+1. Install **Python 3.12** from python.org. During the setup, tick *Add python.exe to PATH*.
+2. Copy this folder to `C:\mt5-mcp-server`.
+3. Open a command prompt and install the dependencies:
+   ```
+   pip install -r C:\mt5-mcp-server\requirements.txt
+   ```
+4. Install **Claude Desktop** and sign in.
+5. In Claude Desktop, open **Settings → Developer → Edit Config**. Copy the content of
+   `claude_desktop_config.example.json` into `claude_desktop_config.json`. If the file already has an
+   `mcpServers` section, add the `metatrader5` entry to it.
+6. Open MetaTrader 5, log in to a **demo** account and enable **Algo Trading**.
+7. Quit Claude Desktop completely (including the tray icon), then start it again. The `metatrader5` tools
+   now appear in the tools menu of a new conversation.
+
+Try: *"Show me my MetaTrader account and the EURUSD price."*
+
+## Testing without MetaTrader
+
+The `MetaTrader5` package only works on Windows. The server was smoke-tested end to end over stdio against
+a fake `MetaTrader5` module. That test covered the tool list, the read tools, and opening, modifying and
+closing a position. It also covered each refusal: lots above the limit, a missing stop loss, a stop loss on
+the wrong side, risk above the limit, and a real account.
