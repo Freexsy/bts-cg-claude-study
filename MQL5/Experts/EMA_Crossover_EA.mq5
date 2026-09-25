@@ -3,12 +3,22 @@
 //|                  Long-only EMA 40 / EMA 200 crossover strategy   |
 //+------------------------------------------------------------------+
 #property copyright   "bts-cg-claude-study"
-#property version     "1.00"
+#property version     "1.10"
 #property description "Opens a long position every time the fast EMA (default 40) crosses above"
-#property description "the slow EMA (default 200). Fixed lot size, stop loss and take profit in pips,"
-#property description "with adjustable trading hours and trading days. Orders are sent via CTrade."
+#property description "the slow EMA (default 200). Fixed or ATR based SL/TP, optional break-even,"
+#property description "trailing stop, trend and cooldown filters, adjustable trading hours and days."
+#property description "Orders are sent via CTrade."
 
 #include <Trade\Trade.mqh>
+
+//+------------------------------------------------------------------+
+//| Enums                                                            |
+//+------------------------------------------------------------------+
+enum ENUM_STOP_MODE
+  {
+   STOP_MODE_PIPS = 0,   // Fixed pips
+   STOP_MODE_ATR  = 1    // ATR multiple
+  };
 
 //+------------------------------------------------------------------+
 //| Inputs                                                           |
@@ -19,15 +29,35 @@ input int                InpFastEMAPeriod   = 40;              // Fast EMA perio
 input int                InpSlowEMAPeriod   = 200;             // Slow EMA period
 input ENUM_APPLIED_PRICE InpAppliedPrice    = PRICE_CLOSE;     // EMA applied price
 
+input group "Signal filters"
+input bool               InpUseTrendFilter  = false;           // Only buy when the slow EMA is rising
+input int                InpTrendSlopeBars  = 10;              // Slow EMA slope lookback (bars)
+input int                InpCooldownBars    = 0;               // Min bars between two entries (0 = off)
+
 input group "Trade management"
 input double             InpLotSize         = 0.5;             // Lot size
+input ENUM_STOP_MODE     InpStopMode        = STOP_MODE_PIPS;  // SL/TP mode
 input double             InpStopLossPips    = 20.0;            // Stop loss in pips (0 = no SL)
 input double             InpTakeProfitPips  = 40.0;            // Take profit in pips (0 = no TP)
+input int                InpATRPeriod       = 14;              // ATR period (ATR mode)
+input double             InpATRStopMult     = 1.5;             // Stop loss = ATR x (ATR mode, 0 = no SL)
+input double             InpATRTakeMult     = 3.0;             // Take profit = ATR x (ATR mode, 0 = no TP)
 input int                InpMaxPositions    = 0;               // Max open positions (0 = unlimited)
 input int                InpPointsPerPip    = 0;               // Points per pip (0 = auto-detect)
 input ulong              InpMagicNumber     = 402000;          // Magic number
 input uint               InpSlippagePoints  = 10;              // Max slippage (points)
 input string             InpOrderComment    = "EMA Cross EA";  // Order comment
+
+input group "Break-even"
+input bool               InpUseBreakEven    = false;           // Move SL to break-even
+input double             InpBreakEvenTrigger = 20.0;           // Profit that triggers break-even (pips)
+input double             InpBreakEvenLock   = 2.0;             // Pips locked above entry price
+
+input group "Trailing stop"
+input bool               InpUseTrailingStop = false;           // Use trailing stop
+input double             InpTrailingStart   = 25.0;            // Profit that starts trailing (pips)
+input double             InpTrailingDistance = 15.0;           // Distance between price and SL (pips)
+input double             InpTrailingStep    = 5.0;             // Minimum SL improvement (pips)
 
 input group "Trading hours (broker server time)"
 input bool               InpUseTradingHours = true;            // Restrict trading to a time window
@@ -55,6 +85,7 @@ input bool               InpShowPanel       = true;            // Show info pane
 #define MAX_SEND_ATTEMPTS  3      // attempts for transient errors (requote, price changed ...)
 #define RETRY_DELAY_MS     300
 #define PANEL_REFRESH_MS   1000
+#define MODIFY_RETRY_SEC   10     // pause after a rejected SL modification
 
 //+------------------------------------------------------------------+
 //| Globals                                                          |
@@ -63,6 +94,7 @@ CTrade          g_trade;
 ENUM_TIMEFRAMES g_timeframe      = PERIOD_CURRENT;
 int             g_fastHandle     = INVALID_HANDLE;
 int             g_slowHandle     = INVALID_HANDLE;
+int             g_atrHandle      = INVALID_HANDLE;
 datetime        g_lastBarTime    = 0;   // open time of the last processed signal bar
 datetime        g_lastSignalTime = 0;   // close bar time of the last detected crossover
 double          g_pipSize        = 0.0; // price distance of one pip
@@ -97,6 +129,16 @@ int OnInit()
       return(INIT_FAILED);
      }
 
+   if(InpStopMode == STOP_MODE_ATR)
+     {
+      g_atrHandle = iATR(_Symbol, g_timeframe, InpATRPeriod);
+      if(g_atrHandle == INVALID_HANDLE)
+        {
+         PrintFormat("%s: failed to create ATR indicator handle (error %d)", EA_NAME, GetLastError());
+         return(INIT_FAILED);
+        }
+     }
+
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(InpSlippagePoints);
    g_trade.SetTypeFillingBySymbol(_Symbol);
@@ -108,9 +150,10 @@ int OnInit()
       PrintFormat("%s: netting account - a new signal adds to the existing position and replaces its SL/TP",
                   EA_NAME);
 
-   PrintFormat("%s started on %s %s | EMA %d/%d | %.2f lots | SL %.1f pips | TP %.1f pips | 1 pip = %s",
+   PrintFormat("%s started on %s %s | EMA %d/%d | %.2f lots | %s | 1 pip = %s",
                EA_NAME, _Symbol, TimeframeToString(g_timeframe), InpFastEMAPeriod, InpSlowEMAPeriod,
-               g_lotSize, InpStopLossPips, InpTakeProfitPips, DoubleToString(g_pipSize, _Digits));
+               g_lotSize, StopsDescription(), DoubleToString(g_pipSize, _Digits));
+   PrintFormat("%s: %s", EA_NAME, OptionsDescription());
 
    UpdatePanel(true);
    return(INIT_SUCCEEDED);
@@ -125,8 +168,11 @@ void OnDeinit(const int reason)
       IndicatorRelease(g_fastHandle);
    if(g_slowHandle != INVALID_HANDLE)
       IndicatorRelease(g_slowHandle);
+   if(g_atrHandle != INVALID_HANDLE)
+      IndicatorRelease(g_atrHandle);
    g_fastHandle = INVALID_HANDLE;
    g_slowHandle = INVALID_HANDLE;
+   g_atrHandle  = INVALID_HANDLE;
 
    Comment("");
   }
@@ -136,6 +182,7 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
   {
+   ManageOpenPositions();
    CheckForSignal();
    UpdatePanel(false);
   }
@@ -150,7 +197,8 @@ void CheckForSignal()
       return;
 
 //--- make sure the slow EMA has enough history to be meaningful
-   if(Bars(_Symbol, g_timeframe) < InpSlowEMAPeriod + 2)
+   int minBars = InpSlowEMAPeriod + (InpUseTrendFilter ? InpTrendSlopeBars : 0) + 2;
+   if(Bars(_Symbol, g_timeframe) < minBars)
       return;
 
    double fast[], slow[];
@@ -167,6 +215,23 @@ void CheckForSignal()
    g_lastSignalTime = iTime(_Symbol, g_timeframe, 1);
    PrintFormat("%s: bullish crossover on bar %s (fast %s > slow %s)", EA_NAME,
                TimeToString(g_lastSignalTime), DoubleToString(fast[0], _Digits), DoubleToString(slow[0], _Digits));
+
+   if(InpUseTrendFilter && !IsSlowEMARising())
+     {
+      PrintFormat("%s: signal skipped - slow EMA is not rising over the last %d bars", EA_NAME, InpTrendSlopeBars);
+      return;
+     }
+
+   if(InpCooldownBars > 0)
+     {
+      int barsSinceEntry = BarsSinceLastEntry();
+      if(barsSinceEntry >= 0 && barsSinceEntry < InpCooldownBars)
+        {
+         PrintFormat("%s: signal skipped - last entry was %d bar(s) ago, cooldown is %d bars", EA_NAME,
+                     barsSinceEntry, InpCooldownBars);
+         return;
+        }
+     }
 
    if(!IsTradingTimeAllowed(TimeCurrent()))
      {
@@ -191,6 +256,10 @@ void CheckForSignal()
 //+------------------------------------------------------------------+
 bool OpenLong()
   {
+   double slDistance = 0.0, tpDistance = 0.0;
+   if(!GetStopDistances(slDistance, tpDistance))
+      return(false);
+
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double margin = 0.0;
    if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, g_lotSize, ask, margin))
@@ -215,8 +284,8 @@ bool OpenLong()
         }
 
       double price = tick.ask;
-      double sl    = (InpStopLossPips   > 0.0) ? NormalizePrice(price - InpStopLossPips   * g_pipSize) : 0.0;
-      double tp    = (InpTakeProfitPips > 0.0) ? NormalizePrice(price + InpTakeProfitPips * g_pipSize) : 0.0;
+      double sl    = (slDistance > 0.0) ? NormalizePrice(price - slDistance) : 0.0;
+      double tp    = (tpDistance > 0.0) ? NormalizePrice(price + tpDistance) : 0.0;
 
       if(!CheckStopsDistance(tick, sl, tp))
          return(false);
@@ -240,6 +309,132 @@ bool OpenLong()
      }
 
    return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Break-even and trailing stop for this EA's open positions        |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+  {
+   if((!InpUseBreakEven && !InpUseTrailingStop) || PositionsTotal() == 0)
+      return;
+
+   static datetime retryAfter = 0;
+   if(TimeCurrent() < retryAfter)
+      return;
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick) || tick.bid <= 0.0)
+      return;
+
+   double minDistance    = MathMax((double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL), 1.0) * _Point;
+   double freezeDistance = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL) * _Point;
+   double minStep        = InpUseTrailingStop ? MathMax(InpTrailingStep * g_pipSize, _Point) : _Point;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
+         PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber ||
+         PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY)
+         continue;
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      double profit    = tick.bid - openPrice;
+      double newSL     = currentSL;
+
+      if(InpUseBreakEven && profit >= InpBreakEvenTrigger * g_pipSize)
+         newSL = MathMax(newSL, NormalizePrice(openPrice + InpBreakEvenLock * g_pipSize));
+
+      if(InpUseTrailingStop && profit >= InpTrailingStart * g_pipSize)
+         newSL = MathMax(newSL, NormalizePrice(tick.bid - InpTrailingDistance * g_pipSize));
+
+      //--- only move the stop up, by at least one step, and never inside the broker's stop/freeze levels
+      if(newSL <= 0.0)
+         continue;
+      if(currentSL > 0.0 && newSL - currentSL < minStep - _Point / 2.0)
+         continue;
+      if(tick.bid - newSL < minDistance)
+         continue;
+      if(freezeDistance > 0.0 &&
+         ((currentSL > 0.0 && tick.bid - currentSL <= freezeDistance) ||
+          (currentTP > 0.0 && currentTP - tick.bid <= freezeDistance)))
+         continue;
+
+      if(g_trade.PositionModify(ticket, newSL, currentTP) && g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
+        {
+         PrintFormat("%s: position #%I64u stop loss moved from %s to %s", EA_NAME, ticket,
+                     DoubleToString(currentSL, _Digits), DoubleToString(newSL, _Digits));
+        }
+      else
+        {
+         PrintFormat("%s: failed to modify position #%I64u - retcode %u (%s), retrying in %d s", EA_NAME, ticket,
+                     g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription(), MODIFY_RETRY_SEC);
+         retryAfter = TimeCurrent() + MODIFY_RETRY_SEC;
+         return;
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| SL/TP distances from the entry price (fixed pips or ATR based)   |
+//+------------------------------------------------------------------+
+bool GetStopDistances(double &slDistance, double &tpDistance)
+  {
+   if(InpStopMode == STOP_MODE_PIPS)
+     {
+      slDistance = InpStopLossPips * g_pipSize;
+      tpDistance = InpTakeProfitPips * g_pipSize;
+      return(true);
+     }
+
+   double atr[];
+   if(CopyBuffer(g_atrHandle, 0, 1, 1, atr) != 1 || atr[0] <= 0.0)
+     {
+      PrintFormat("%s: ATR value not available (error %d) - trade skipped", EA_NAME, GetLastError());
+      return(false);
+     }
+   slDistance = InpATRStopMult * atr[0];
+   tpDistance = InpATRTakeMult * atr[0];
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Trend filter: slow EMA higher than it was N bars ago             |
+//+------------------------------------------------------------------+
+bool IsSlowEMARising()
+  {
+   int count = InpTrendSlopeBars + 1;
+   double slow[];
+   ArraySetAsSeries(slow, true);
+   if(CopyBuffer(g_slowHandle, 0, 1, count, slow) != count)
+      return(false);
+   return(slow[0] > slow[InpTrendSlopeBars]);
+  }
+
+//+------------------------------------------------------------------+
+//| Bars since this EA's last entry on the symbol, -1 if none        |
+//+------------------------------------------------------------------+
+int BarsSinceLastEntry()
+  {
+   if(!HistorySelect(0, TimeCurrent()))
+      return(-1);
+
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+     {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0)
+         continue;
+      if(HistoryDealGetString(deal, DEAL_SYMBOL) == _Symbol &&
+         HistoryDealGetInteger(deal, DEAL_MAGIC) == (long)InpMagicNumber &&
+         HistoryDealGetInteger(deal, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         return(iBarShift(_Symbol, g_timeframe, (datetime)HistoryDealGetInteger(deal, DEAL_TIME)));
+     }
+   return(-1);
   }
 
 //+------------------------------------------------------------------+
@@ -456,6 +651,31 @@ bool ValidateInputs()
       Print(EA_NAME, ": stop loss and take profit cannot be negative");
       ok = false;
      }
+   if(InpStopMode == STOP_MODE_ATR && (InpATRPeriod < 1 || InpATRStopMult < 0.0 || InpATRTakeMult < 0.0))
+     {
+      Print(EA_NAME, ": ATR period must be at least 1 and ATR multipliers cannot be negative");
+      ok = false;
+     }
+   if(InpUseBreakEven && (InpBreakEvenTrigger <= 0.0 || InpBreakEvenLock < 0.0 || InpBreakEvenLock >= InpBreakEvenTrigger))
+     {
+      Print(EA_NAME, ": break-even trigger must be > 0 and the locked pips must be between 0 and the trigger");
+      ok = false;
+     }
+   if(InpUseTrailingStop && (InpTrailingStart < 0.0 || InpTrailingDistance <= 0.0 || InpTrailingStep < 0.0))
+     {
+      Print(EA_NAME, ": trailing distance must be > 0, trailing start and step cannot be negative");
+      ok = false;
+     }
+   if(InpUseTrendFilter && InpTrendSlopeBars < 1)
+     {
+      Print(EA_NAME, ": trend slope lookback must be at least 1 bar");
+      ok = false;
+     }
+   if(InpCooldownBars < 0)
+     {
+      Print(EA_NAME, ": cooldown bars cannot be negative");
+      ok = false;
+     }
    if(InpMaxPositions < 0)
      {
       Print(EA_NAME, ": max open positions cannot be negative");
@@ -511,13 +731,37 @@ void UpdatePanel(const bool force)
 
    string text = StringFormat("%s  |  %s %s\n", EA_NAME, _Symbol, TimeframeToString(g_timeframe));
    text += emaLine + "\n";
-   text += StringFormat("Lots: %.2f   SL: %.1f pips   TP: %.1f pips   Magic: %I64u\n",
-                        g_lotSize, InpStopLossPips, InpTakeProfitPips, InpMagicNumber);
+   text += StringFormat("Lots: %.2f   %s   Magic: %I64u\n", g_lotSize, StopsDescription(), InpMagicNumber);
+   text += OptionsDescription() + "\n";
    text += "Schedule: " + ScheduleDescription() + "\n";
    text += "Status: " + status + "\n";
    text += StringFormat("Open positions: %d   Last crossover: %s", CountOpenPositions(), lastSignal);
 
    Comment(text);
+  }
+
+//+------------------------------------------------------------------+
+string StopsDescription()
+  {
+   if(InpStopMode == STOP_MODE_ATR)
+      return(StringFormat("SL: ATR(%d) x%.2f   TP: ATR(%d) x%.2f",
+                          InpATRPeriod, InpATRStopMult, InpATRPeriod, InpATRTakeMult));
+   return(StringFormat("SL: %.1f pips   TP: %.1f pips", InpStopLossPips, InpTakeProfitPips));
+  }
+
+//+------------------------------------------------------------------+
+string OptionsDescription()
+  {
+   string breakEven = InpUseBreakEven
+                      ? StringFormat("at +%.1f pips (lock %.1f)", InpBreakEvenTrigger, InpBreakEvenLock)
+                      : "off";
+   string trailing  = InpUseTrailingStop
+                      ? StringFormat("from +%.1f pips, %.1f pips behind", InpTrailingStart, InpTrailingDistance)
+                      : "off";
+   string trend     = InpUseTrendFilter ? StringFormat("%d bars", InpTrendSlopeBars) : "off";
+   string cooldown  = (InpCooldownBars > 0) ? StringFormat("%d bars", InpCooldownBars) : "off";
+   return(StringFormat("Break-even: %s | Trailing: %s | Trend filter: %s | Cooldown: %s",
+                       breakEven, trailing, trend, cooldown));
   }
 
 //+------------------------------------------------------------------+
