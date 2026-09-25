@@ -2,14 +2,16 @@
 
 ## EMA Crossover EA (MetaTrader 5)
 
-`MQL5/Experts/EMA_Crossover_EA.mq5` is a long-only Expert Advisor. Each time the
+`MQL5/Experts/EMA_Crossover_EA.mq5` is an EMA crossover Expert Advisor. Each time the
 40 EMA crosses above the 200 EMA, it opens a buy position with a fixed lot size, stop loss and take profit.
+Optionally it also sells when the 40 EMA crosses below the 200 EMA.
 Orders are sent with the standard library `CTrade` class.
 
 ### Strategy
 
 - **Signal:** the fast EMA (default 40) closes above the slow EMA (default 200), and on the bar
-  before it was at or below the slow EMA.
+  before it was at or below the slow EMA. In *Sell only* or *Buy and sell* mode, the opposite
+  crossover opens a sell.
 - **Confirmation:** the EA checks only closed bars, so a signal can't disappear later. The trade opens on
   the first tick of the bar after the crossover.
 - **Order:** buy 0.5 lots, SL 20 pips below entry, TP 40 pips above entry (all adjustable).
@@ -20,6 +22,7 @@ Orders are sent with the standard library `CTrade` class.
   - break-even and trailing stop
   - a trend filter that buys only when the slow EMA is rising
   - a cooldown: a minimum number of bars between two entries
+  - sell trades, and closing positions at the end of the trading session (no position held overnight)
 
 ### Installation
 
@@ -36,7 +39,8 @@ Orders are sent with the standard library `CTrade` class.
 | | Fast EMA period | 40 | |
 | | Slow EMA period | 200 | Must be greater than the fast period |
 | | EMA applied price | Close | |
-| Signal filters | Only buy when the slow EMA is rising | false | Skips crossovers when the slow EMA is lower than it was N bars ago |
+| | Trade direction | Buy only | *Buy only*, *Sell only* or *Buy and sell* |
+| Signal filters | Trade only in the direction of the slow EMA slope | false | Buys only if the slow EMA is higher than N bars ago, sells only if it is lower |
 | | Slow EMA slope lookback | 10 | N, in bars |
 | | Min bars between two entries | 0 | `0` = off. Skips signals that come too soon after the last entry |
 | Trade management | Lot size mode | Fixed lots | *Fixed lots* or *Risk % of balance* |
@@ -49,13 +53,14 @@ Orders are sent with the standard library `CTrade` class.
 | | Stop loss = ATR x | 1.5 | ATR mode. `0` = no stop loss |
 | | Take profit = ATR x | 3.0 | ATR mode. `0` = no take profit |
 | | Max open positions | 0 | `0` = unlimited (every crossover opens a trade) |
+| | Close opposite positions on a new signal | true | A bearish crossover closes the open buys, a bullish one the open sells (only when that signal is traded) |
 | | Points per pip | 0 | `0` = auto (10 points on 3/5-digit symbols, otherwise 1). Set it manually for gold, indices, etc. |
 | | Magic number | 402000 | Identifies this EA's positions |
 | | Max slippage (points) | 10 | |
 | | Order comment | EMA Cross EA | |
 | Break-even | Move SL to break-even | false | |
 | | Profit that triggers break-even | 1.0 x SL | As a multiple of the SL distance: 1.0 = when the profit equals the initial risk |
-| | Pips locked above entry | 2 pips | Covers spread and commission |
+| | Pips locked in profit | 2 pips | Covers spread and commission |
 | Trailing stop | Use trailing stop | false | |
 | | Profit that starts trailing | 25 pips | |
 | | Distance between price and SL | 15 pips | |
@@ -63,6 +68,7 @@ Orders are sent with the standard library `CTrade` class.
 | Trading hours | Restrict trading to a time window | true | Turn off to trade 24h |
 | | Start hour / minute | 08:00 | Broker server time |
 | | End hour / minute | 20:00 | Exclusive. If the start is later than the end, the window crosses midnight (for example 22:00–04:00). The same start and end means the whole day. |
+| | Close open positions outside trading hours/days | false | Closes every position of the EA when the window ends, so no position is held overnight |
 | Trading days | Monday … Sunday | Mon–Fri on | The day filter uses the server day when the signal happens |
 | Display | Show info panel on chart | true | Shows EMA values, settings, status and open positions |
 
@@ -80,6 +86,22 @@ Orders are sent with the standard library `CTrade` class.
 - In ATR mode the SL distance changes with volatility, so with a fixed lot size the money at risk
   per trade changes too.
 - Test it in the Strategy Tester (Ctrl+R) or on a demo account before trading live.
+
+### Short-term (intraday) setup
+
+To trade short moves and be flat every evening:
+
+| Input | Value |
+|---|---|
+| Timeframe (Strategy Tester *Settings* tab) | M15 |
+| Trade direction | Buy and sell |
+| Lot size mode / Risk per trade | Risk % of balance / 1 % |
+| SL/TP mode | ATR multiple (1.5 / 3.0) |
+| Restrict trading to a time window | true, 08:00–20:00 |
+| Close open positions outside trading hours/days | true |
+
+On M15 the ATR is small, so the SL is typically a few pips and the spread takes a larger share of each
+trade. Check the results with *Every tick based on real ticks* modelling.
 
 ### Suggested test plan
 
