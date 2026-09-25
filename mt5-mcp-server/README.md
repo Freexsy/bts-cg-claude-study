@@ -45,7 +45,7 @@ Every order and every refusal is written to `mt5_mcp_actions.log`, next to the s
 
 ## Installation (Windows)
 
-1. Install **Python 3.12 or 3.13** from python.org. You don't need the *Add python.exe to PATH* option, because
+1. Install **Python 3.10 to 3.14 (64-bit)** from python.org. You don't need the *Add python.exe to PATH* option, because
    step 5 uses the full path to Python.
 2. Copy this folder to `C:\mt5-mcp-server`.
 3. Open a command prompt and install the dependencies. The `py` launcher comes with every python.org install:
