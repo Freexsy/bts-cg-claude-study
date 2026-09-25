@@ -118,3 +118,58 @@ with the trading hours filter off. Change **one** setting at a time and compare 
 
 With ATR stops, the SL distance changes from trade to trade. Use *Lot size mode* = Risk % of balance,
 so that every trade risks the same amount of money.
+
+## Session Breakout EA (MetaTrader 5)
+
+`MQL5/Experts/Session_Breakout_EA.mq5` is an intraday breakout Expert Advisor. It never holds
+a position overnight.
+
+### Strategy
+
+1. **Night range:** the EA measures the high and low of the quiet night (Asian) session, 02:00–09:00 server time.
+2. **Orders at the London open:** at 09:00 it places a buy stop just above the range and a sell stop
+   just below it. The stop loss is on the other side of the range, and the take profit is 1× the stop loss distance.
+3. **One trade per day:** when one order is filled, the other one is deleted. Orders that are still
+   unfilled at 13:00 are deleted.
+4. **Flat every evening:** every position is closed at 21:00.
+5. **Filters:** days with an abnormally small or large night range (relative to the daily ATR) and moments
+   with a wide spread are skipped.
+6. **Risk:** the lot size is calculated so that a stop loss costs 1 % of the balance.
+
+The default times assume a broker whose server runs on GMT+2 in winter and GMT+3 in summer
+(for example MetaQuotes-Demo). With that server time, 02:00–09:00 is 00:00–07:00 in London and 09:00 is the Frankfurt open.
+If your broker uses another server time, shift all the times by the difference.
+
+### Inputs
+
+| Group | Input | Default | Description |
+|---|---|---|---|
+| Session times | Range start / end | 02:00 / 09:00 | Night range. Orders are placed at the range end |
+| | Entry deadline | 13:00 | Unfilled orders are deleted |
+| | Close all positions at | 21:00 | End of the trading day |
+| Breakout | Trade direction | Buy and sell | |
+| | Order distance beyond the range | 1 pip | |
+| | Delete the other order once one is filled | true | One trade per day |
+| | Daily ATR period | 14 | Used by the range filter |
+| | Min / max range size | 0.1 / 1.0 × daily ATR | `0` = off |
+| | Max spread to place the orders | 3 pips | `0` = off. The EA waits until the spread is lower |
+| Risk management | Lot size mode | Risk % of balance | or *Fixed lots* |
+| | Risk per trade | 1 % | |
+| | Lot size | 0.1 | Fixed mode only |
+| | Stop loss | 1.0 × range | 1.0 = other side of the range |
+| | Take profit | 1.0 × stop loss | `0` = no take profit, exit at the close time |
+| | Move SL to break-even | false | Triggered at 0.5 × the SL distance, locks 1 pip |
+| Trading days | Monday … Friday | all on | |
+| General | Points per pip, magic number (403000), slippage, comment, panel, range drawing | | |
+
+### Test protocol
+
+Keep the default settings and do not change them between tests.
+
+1. EURUSD, 2020.01.01 → 2023.12.31, *Every tick based on real ticks*.
+2. EURUSD, 2024.01.01 → today: a period the first test did not use.
+3. GBPUSD, both periods.
+
+The strategy is worth trading on a demo account only if the profit factor is above about 1.1 and the maximum
+drawdown is below about 20 % in **every** test. If you change a setting to improve test 1, you must
+confirm the change on test 2 without touching it again.
