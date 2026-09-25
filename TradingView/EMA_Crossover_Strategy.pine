@@ -1,0 +1,112 @@
+//@version=6
+// EMA crossover strategy - TradingView port of MQL5/Experts/EMA_Crossover_EA.mq5
+// Buys when the fast EMA crosses above the slow EMA and, optionally, sells on the opposite crossover.
+// Signals are evaluated on closed bars and orders are filled at the open of the next bar.
+// TradingView backtests have no spread: the default commission (0.005 % per order, about 1 pip
+// per round trip on EURUSD) stands in for it.
+strategy("EMA Crossover Strategy", shorttitle = "EMA Cross", overlay = true,
+     initial_capital = 10000, currency = currency.USD, pyramiding = 0,
+     default_qty_type = strategy.fixed, default_qty_value = 50000,
+     margin_long = 3.33, margin_short = 3.33,
+     commission_type = strategy.commission.percent, commission_value = 0.005)
+
+// ── Inputs ──────────────────────────────────────────────────────────
+GRP_STRATEGY = "Strategy"
+GRP_RISK     = "Stops and position size"
+GRP_SESSION  = "Trading session"
+
+fastLength   = input.int(40, "Fast EMA period", minval = 1, group = GRP_STRATEGY)
+slowLength   = input.int(200, "Slow EMA period", minval = 2, group = GRP_STRATEGY)
+emaSource    = input.source(close, "EMA source", group = GRP_STRATEGY)
+direction    = input.string("Buy only", "Trade direction", options = ["Buy only", "Sell only", "Buy and sell"], group = GRP_STRATEGY)
+
+stopMode     = input.string("Fixed pips", "SL/TP mode", options = ["Fixed pips", "ATR multiple"], group = GRP_RISK)
+slPips       = input.float(20.0, "Stop loss (pips, fixed mode)", minval = 0.1, group = GRP_RISK)
+tpPips       = input.float(40.0, "Take profit (pips, fixed mode)", minval = 0.1, group = GRP_RISK)
+atrLength    = input.int(14, "ATR period (ATR mode)", minval = 1, group = GRP_RISK)
+atrSlMult    = input.float(1.5, "Stop loss = ATR x (ATR mode)", minval = 0.1, group = GRP_RISK)
+atrTpMult    = input.float(3.0, "Take profit = ATR x (ATR mode)", minval = 0.1, group = GRP_RISK)
+sizeMode     = input.string("Fixed quantity", "Position size mode", options = ["Fixed quantity", "Risk % of equity"], group = GRP_RISK)
+fixedQty     = input.float(50000, "Fixed quantity (forex: 50,000 units = 0.5 lot)", minval = 0, group = GRP_RISK)
+riskPercent  = input.float(1.0, "Risk per trade (% of equity)", minval = 0.01, maxval = 100, group = GRP_RISK)
+qtyStep      = input.float(1000, "Round quantity down to a multiple of", minval = 0, tooltip = "1,000 = forex micro lot, 1 = shares, 0 = no rounding", group = GRP_RISK)
+pipOverride  = input.float(0.0, "Pip size (0 = auto)", minval = 0, tooltip = "Auto: 10 ticks on 3/5 digit forex quotes, otherwise 1 tick", group = GRP_RISK)
+
+useSession   = input.bool(false, "Only enter during the session", group = GRP_SESSION)
+sessionTimes = input.session("0800-2000:23456", "Session", tooltip = "Days: 1 = Sunday ... 7 = Saturday. 23456 = Monday to Friday", group = GRP_SESSION)
+sessionTz    = input.string("Europe/Paris", "Session time zone", group = GRP_SESSION)
+closeOutside = input.bool(false, "Close positions outside the session", group = GRP_SESSION)
+
+// ── Calculations ────────────────────────────────────────────────────
+int   priceDecimals = math.round(-math.log10(syminfo.mintick))
+float autoPip       = syminfo.type == "forex" and (priceDecimals == 3 or priceDecimals == 5) ? syminfo.mintick * 10 : syminfo.mintick
+float pipSize       = pipOverride > 0 ? pipOverride : autoPip
+
+float fastEma      = ta.ema(emaSource, fastLength)
+float slowEma      = ta.ema(emaSource, slowLength)
+float atrValue     = ta.atr(atrLength)
+bool  crossUpRaw   = ta.crossover(fastEma, slowEma)
+bool  crossDownRaw = ta.crossunder(fastEma, slowEma)
+bool  warmedUp     = bar_index > slowLength
+bool  crossUp      = warmedUp and crossUpRaw
+bool  crossDown    = warmedUp and crossDownRaw
+
+bool  sessionOpen  = not na(time(timeframe.period, sessionTimes, sessionTz))
+bool  inSession    = not useSession or sessionOpen
+
+float slDistance   = stopMode == "ATR multiple" ? atrValue * atrSlMult : slPips * pipSize
+float tpDistance   = stopMode == "ATR multiple" ? atrValue * atrTpMult : tpPips * pipSize
+
+// quantity that loses riskPercent of the equity at the stop loss, in the account currency
+float fxRate       = nz(request.currency_rate(syminfo.currency, strategy.account_currency, true), 1.0)
+float lossPerUnit  = slDistance * syminfo.pointvalue * fxRate
+float riskQty      = lossPerUnit > 0 ? strategy.equity * riskPercent / 100 / lossPerUnit : 0.0
+float rawQty       = sizeMode == "Risk % of equity" ? riskQty : fixedQty
+float orderQty     = qtyStep > 0 ? math.floor(rawQty / qtyStep) * qtyStep : rawQty
+
+// ── Orders ──────────────────────────────────────────────────────────
+var float slTicks = na
+var float tpTicks = na
+
+bool longSignal  = crossUp and direction != "Sell only"
+bool shortSignal = crossDown and direction != "Buy only"
+bool canEnter    = inSession and orderQty > 0 and slDistance > 0
+
+if longSignal or shortSignal
+    if canEnter
+        slTicks := math.max(1, math.round(slDistance / syminfo.mintick))
+        tpTicks := math.max(1, math.round(tpDistance / syminfo.mintick))
+        if longSignal
+            // also reverses an open short position
+            strategy.entry("Long", strategy.long, qty = orderQty)
+            strategy.exit("Long exit", "Long", loss = slTicks, profit = tpTicks)
+        else
+            strategy.entry("Short", strategy.short, qty = orderQty)
+            strategy.exit("Short exit", "Short", loss = slTicks, profit = tpTicks)
+    else
+        // a filtered signal still invalidates a position in the other direction
+        if longSignal and strategy.position_size < 0
+            strategy.close("Short", comment = "Opposite crossover")
+        if shortSignal and strategy.position_size > 0
+            strategy.close("Long", comment = "Opposite crossover")
+
+if useSession and closeOutside and not sessionOpen and strategy.position_size != 0
+    strategy.close_all(comment = "Outside session")
+
+// ── Chart ───────────────────────────────────────────────────────────
+float stopLevel   = na
+float targetLevel = na
+if strategy.position_size > 0
+    stopLevel   := strategy.position_avg_price - slTicks * syminfo.mintick
+    targetLevel := strategy.position_avg_price + tpTicks * syminfo.mintick
+else if strategy.position_size < 0
+    stopLevel   := strategy.position_avg_price + slTicks * syminfo.mintick
+    targetLevel := strategy.position_avg_price - tpTicks * syminfo.mintick
+
+plot(fastEma, "Fast EMA", color = color.orange, linewidth = 2)
+plot(slowEma, "Slow EMA", color = color.blue, linewidth = 2)
+plot(stopLevel, "Stop loss", color = color.red, style = plot.style_linebr)
+plot(targetLevel, "Take profit", color = color.green, style = plot.style_linebr)
+plotshape(crossUp, title = "Bullish crossover", style = shape.triangleup, location = location.belowbar, color = color.green, size = size.small)
+plotshape(crossDown, title = "Bearish crossover", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small)
+bgcolor(useSession and not sessionOpen ? color.new(color.gray, 92) : na, title = "Outside session")

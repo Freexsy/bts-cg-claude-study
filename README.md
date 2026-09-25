@@ -173,3 +173,20 @@ Keep the default settings and do not change them between tests.
 The strategy is worth trading on a demo account only if the profit factor is above about 1.1 and the maximum
 drawdown is below about 20 % in **every** test. If you change a setting to improve test 1, you must
 confirm the change on test 2 without touching it again.
+
+## EMA Crossover Strategy (TradingView)
+
+`TradingView/EMA_Crossover_Strategy.pine` is a Pine Script v6 port of the EMA Crossover EA. You can use it to
+backtest the idea in TradingView's Strategy Tester and see the signals on any chart.
+
+**Install:** open a chart, open the **Pine Editor**, replace its content with the file, then click
+**Save** and **Add to chart**. The results are in the **Strategy Tester** tab.
+
+- The inputs match the MT5 EA: trade direction, fixed pips or ATR stops, fixed quantity or risk % of
+  equity, and an optional session with close outside the session.
+- On forex, quantities are in units: 50,000 = 0.5 lot.
+- The strategy uses 30:1 margin, so it can simulate forex leverage.
+- TradingView backtests have no spread. The default commission of 0.005 % per order stands in for about
+  1 pip per round trip on EURUSD. Adjust it for other markets.
+- A TradingView strategy does not place real orders. Automated trading needs alerts sent by
+  webhook (paid plan) to a broker or a bridge.
