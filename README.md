@@ -16,6 +16,7 @@ Orders are sent with the standard library `CTrade` class.
 - **Filters:** trading hours, trading days, optional maximum number of open positions.
 - **Optional improvements** (all off by default, so the default settings trade the original strategy):
   - SL/TP as a multiple of the ATR instead of fixed pips
+  - lot size calculated from a fixed % of the balance risked per trade
   - break-even and trailing stop
   - a trend filter that buys only when the slow EMA is rising
   - a cooldown: a minimum number of bars between two entries
@@ -38,7 +39,9 @@ Orders are sent with the standard library `CTrade` class.
 | Signal filters | Only buy when the slow EMA is rising | false | Skips crossovers when the slow EMA is lower than it was N bars ago |
 | | Slow EMA slope lookback | 10 | N, in bars |
 | | Min bars between two entries | 0 | `0` = off. Skips signals that come too soon after the last entry |
-| Trade management | Lot size | 0.5 | Rounded to the broker's volume step and limits |
+| Trade management | Lot size mode | Fixed lots | *Fixed lots* or *Risk % of balance* |
+| | Lot size | 0.5 | Fixed mode. Rounded to the broker's volume step and limits |
+| | Risk per trade | 1 % | Risk mode. The lot is sized so that hitting the SL loses this % of the balance. Needs a stop loss |
 | | SL/TP mode | Fixed pips | *Fixed pips* or *ATR multiple* |
 | | Stop loss in pips | 20 | Fixed mode. `0` = no stop loss |
 | | Take profit in pips | 40 | Fixed mode. `0` = no take profit |
@@ -51,7 +54,7 @@ Orders are sent with the standard library `CTrade` class.
 | | Max slippage (points) | 10 | |
 | | Order comment | EMA Cross EA | |
 | Break-even | Move SL to break-even | false | |
-| | Profit that triggers break-even | 20 pips | |
+| | Profit that triggers break-even | 1.0 x SL | As a multiple of the SL distance: 1.0 = when the profit equals the initial risk |
 | | Pips locked above entry | 2 pips | Covers spread and commission |
 | Trailing stop | Use trailing stop | false | |
 | | Profit that starts trailing | 25 pips | |
@@ -90,3 +93,6 @@ with the trading hours filter off. Change **one** setting at a time and compare 
 5. **Cooldown:** *Min bars between two entries* = 10.
 6. Combine the options that helped, then check the result on other symbols (GBPUSD, USDJPY).
    Settings that only work on one symbol are probably fitted to noise.
+
+With ATR stops, the SL distance changes from trade to trade. Use *Lot size mode* = Risk % of balance,
+so that every trade risks the same amount of money.

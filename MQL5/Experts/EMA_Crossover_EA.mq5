@@ -3,10 +3,10 @@
 //|                  Long-only EMA 40 / EMA 200 crossover strategy   |
 //+------------------------------------------------------------------+
 #property copyright   "bts-cg-claude-study"
-#property version     "1.10"
+#property version     "1.20"
 #property description "Opens a long position every time the fast EMA (default 40) crosses above"
-#property description "the slow EMA (default 200). Fixed or ATR based SL/TP, optional break-even,"
-#property description "trailing stop, trend and cooldown filters, adjustable trading hours and days."
+#property description "the slow EMA (default 200). Fixed or ATR based SL/TP, fixed or risk based lots,"
+#property description "break-even, trailing stop, trend and cooldown filters, trading hours and days."
 #property description "Orders are sent via CTrade."
 
 #include <Trade\Trade.mqh>
@@ -18,6 +18,12 @@ enum ENUM_STOP_MODE
   {
    STOP_MODE_PIPS = 0,   // Fixed pips
    STOP_MODE_ATR  = 1    // ATR multiple
+  };
+
+enum ENUM_LOT_MODE
+  {
+   LOT_MODE_FIXED = 0,   // Fixed lots
+   LOT_MODE_RISK  = 1    // Risk % of balance
   };
 
 //+------------------------------------------------------------------+
@@ -35,7 +41,9 @@ input int                InpTrendSlopeBars  = 10;              // Slow EMA slope
 input int                InpCooldownBars    = 0;               // Min bars between two entries (0 = off)
 
 input group "Trade management"
-input double             InpLotSize         = 0.5;             // Lot size
+input ENUM_LOT_MODE      InpLotMode         = LOT_MODE_FIXED;  // Lot size mode
+input double             InpLotSize         = 0.5;             // Lot size (fixed mode)
+input double             InpRiskPercent     = 1.0;             // Risk per trade, % of balance (risk mode)
 input ENUM_STOP_MODE     InpStopMode        = STOP_MODE_PIPS;  // SL/TP mode
 input double             InpStopLossPips    = 20.0;            // Stop loss in pips (0 = no SL)
 input double             InpTakeProfitPips  = 40.0;            // Take profit in pips (0 = no TP)
@@ -50,7 +58,7 @@ input string             InpOrderComment    = "EMA Cross EA";  // Order comment
 
 input group "Break-even"
 input bool               InpUseBreakEven    = false;           // Move SL to break-even
-input double             InpBreakEvenTrigger = 20.0;           // Profit that triggers break-even (pips)
+input double             InpBreakEvenTriggerR = 1.0;           // Profit that triggers break-even (x SL distance)
 input double             InpBreakEvenLock   = 2.0;             // Pips locked above entry price
 
 input group "Trailing stop"
@@ -98,7 +106,7 @@ int             g_atrHandle      = INVALID_HANDLE;
 datetime        g_lastBarTime    = 0;   // open time of the last processed signal bar
 datetime        g_lastSignalTime = 0;   // close bar time of the last detected crossover
 double          g_pipSize        = 0.0; // price distance of one pip
-double          g_lotSize        = 0.0; // lot size normalised to the symbol's volume rules
+double          g_lotSize        = 0.0; // fixed lot size normalised to the symbol's volume rules
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -111,15 +119,18 @@ int OnInit()
    g_timeframe = (InpTimeframe == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpTimeframe;
    g_pipSize   = CalculatePipSize();
 
-   g_lotSize = NormalizeVolume(InpLotSize);
-   if(g_lotSize <= 0.0)
+   if(InpLotMode == LOT_MODE_FIXED)
      {
-      PrintFormat("%s: lot size %.2f is not valid for %s", EA_NAME, InpLotSize, _Symbol);
-      return(INIT_PARAMETERS_INCORRECT);
+      g_lotSize = NormalizeVolume(InpLotSize);
+      if(g_lotSize <= 0.0)
+        {
+         PrintFormat("%s: lot size %.2f is not valid for %s", EA_NAME, InpLotSize, _Symbol);
+         return(INIT_PARAMETERS_INCORRECT);
+        }
+      if(MathAbs(g_lotSize - InpLotSize) > 1e-8)
+         PrintFormat("%s: lot size %.2f adjusted to %.2f to match the volume limits of %s",
+                     EA_NAME, InpLotSize, g_lotSize, _Symbol);
      }
-   if(MathAbs(g_lotSize - InpLotSize) > 1e-8)
-      PrintFormat("%s: lot size %.2f adjusted to %.2f to match the volume limits of %s",
-                  EA_NAME, InpLotSize, g_lotSize, _Symbol);
 
    g_fastHandle = iMA(_Symbol, g_timeframe, InpFastEMAPeriod, 0, MODE_EMA, InpAppliedPrice);
    g_slowHandle = iMA(_Symbol, g_timeframe, InpSlowEMAPeriod, 0, MODE_EMA, InpAppliedPrice);
@@ -150,9 +161,9 @@ int OnInit()
       PrintFormat("%s: netting account - a new signal adds to the existing position and replaces its SL/TP",
                   EA_NAME);
 
-   PrintFormat("%s started on %s %s | EMA %d/%d | %.2f lots | %s | 1 pip = %s",
+   PrintFormat("%s started on %s %s | EMA %d/%d | %s | %s | 1 pip = %s",
                EA_NAME, _Symbol, TimeframeToString(g_timeframe), InpFastEMAPeriod, InpSlowEMAPeriod,
-               g_lotSize, StopsDescription(), DoubleToString(g_pipSize, _Digits));
+               LotDescription(), StopsDescription(), DoubleToString(g_pipSize, _Digits));
    PrintFormat("%s: %s", EA_NAME, OptionsDescription());
 
    UpdatePanel(true);
@@ -261,8 +272,17 @@ bool OpenLong()
       return(false);
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   double lots = g_lotSize;
+   if(InpLotMode == LOT_MODE_RISK)
+     {
+      lots = CalculateRiskLots(ask, slDistance);
+      if(lots <= 0.0)
+         return(false);
+     }
+
    double margin = 0.0;
-   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, g_lotSize, ask, margin))
+   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, ask, margin))
      {
       PrintFormat("%s: margin calculation failed (error %d)", EA_NAME, GetLastError());
       return(false);
@@ -270,7 +290,7 @@ bool OpenLong()
    if(margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
      {
       PrintFormat("%s: not enough free margin for %.2f lots (required %.2f, free %.2f)", EA_NAME,
-                  g_lotSize, margin, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
+                  lots, margin, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
       return(false);
      }
 
@@ -290,7 +310,7 @@ bool OpenLong()
       if(!CheckStopsDistance(tick, sl, tp))
          return(false);
 
-      bool sent    = g_trade.Buy(g_lotSize, _Symbol, price, sl, tp, InpOrderComment);
+      bool sent    = g_trade.Buy(lots, _Symbol, price, sl, tp, InpOrderComment);
       uint retcode = g_trade.ResultRetcode();
       if(sent && (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL || retcode == TRADE_RETCODE_PLACED))
         {
@@ -347,7 +367,9 @@ void ManageOpenPositions()
       double profit    = tick.bid - openPrice;
       double newSL     = currentSL;
 
-      if(InpUseBreakEven && profit >= InpBreakEvenTrigger * g_pipSize)
+      //--- while the SL is still below entry, its distance is the initial risk of the trade
+      if(InpUseBreakEven && currentSL > 0.0 && currentSL < openPrice &&
+         profit >= InpBreakEvenTriggerR * (openPrice - currentSL))
          newSL = MathMax(newSL, NormalizePrice(openPrice + InpBreakEvenLock * g_pipSize));
 
       if(InpUseTrailingStop && profit >= InpTrailingStart * g_pipSize)
@@ -401,6 +423,32 @@ bool GetStopDistances(double &slDistance, double &tpDistance)
    slDistance = InpATRStopMult * atr[0];
    tpDistance = InpATRTakeMult * atr[0];
    return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Lot size that loses InpRiskPercent of the balance at the SL      |
+//+------------------------------------------------------------------+
+double CalculateRiskLots(const double price, const double slDistance)
+  {
+   double lossPerLot = 0.0;
+   if(slDistance <= 0.0 ||
+      !OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, price - slDistance, lossPerLot) ||
+      lossPerLot >= 0.0)
+     {
+      PrintFormat("%s: could not calculate the loss per lot (error %d) - trade skipped", EA_NAME, GetLastError());
+      return(0.0);
+     }
+
+   double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * InpRiskPercent / 100.0;
+   double lots      = riskMoney / -lossPerLot;
+   double minVolume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if(lots < minVolume)
+     {
+      PrintFormat("%s: risking %.2f%% needs %.3f lots, below the minimum of %.2f - trade skipped",
+                  EA_NAME, InpRiskPercent, lots, minVolume);
+      return(0.0);
+     }
+   return(NormalizeVolume(lots));
   }
 
 //+------------------------------------------------------------------+
@@ -641,9 +689,20 @@ bool ValidateInputs()
          Print(EA_NAME, ": fast EMA period must be smaller than slow EMA period");
          ok = false;
         }
-   if(InpLotSize <= 0.0)
+   if(InpLotMode == LOT_MODE_FIXED && InpLotSize <= 0.0)
      {
       Print(EA_NAME, ": lot size must be greater than 0");
+      ok = false;
+     }
+   if(InpLotMode == LOT_MODE_RISK && (InpRiskPercent <= 0.0 || InpRiskPercent > 100.0))
+     {
+      Print(EA_NAME, ": risk per trade must be between 0 and 100 %");
+      ok = false;
+     }
+   bool hasStopLoss = (InpStopMode == STOP_MODE_PIPS) ? (InpStopLossPips > 0.0) : (InpATRStopMult > 0.0);
+   if(!hasStopLoss && (InpLotMode == LOT_MODE_RISK || InpUseBreakEven))
+     {
+      Print(EA_NAME, ": risk based lot size and break-even need a stop loss");
       ok = false;
      }
    if(InpStopLossPips < 0.0 || InpTakeProfitPips < 0.0)
@@ -656,9 +715,9 @@ bool ValidateInputs()
       Print(EA_NAME, ": ATR period must be at least 1 and ATR multipliers cannot be negative");
       ok = false;
      }
-   if(InpUseBreakEven && (InpBreakEvenTrigger <= 0.0 || InpBreakEvenLock < 0.0 || InpBreakEvenLock >= InpBreakEvenTrigger))
+   if(InpUseBreakEven && (InpBreakEvenTriggerR <= 0.0 || InpBreakEvenLock < 0.0))
      {
-      Print(EA_NAME, ": break-even trigger must be > 0 and the locked pips must be between 0 and the trigger");
+      Print(EA_NAME, ": break-even trigger must be > 0 and the locked pips cannot be negative");
       ok = false;
      }
    if(InpUseTrailingStop && (InpTrailingStart < 0.0 || InpTrailingDistance <= 0.0 || InpTrailingStep < 0.0))
@@ -731,13 +790,21 @@ void UpdatePanel(const bool force)
 
    string text = StringFormat("%s  |  %s %s\n", EA_NAME, _Symbol, TimeframeToString(g_timeframe));
    text += emaLine + "\n";
-   text += StringFormat("Lots: %.2f   %s   Magic: %I64u\n", g_lotSize, StopsDescription(), InpMagicNumber);
+   text += StringFormat("%s   %s   Magic: %I64u\n", LotDescription(), StopsDescription(), InpMagicNumber);
    text += OptionsDescription() + "\n";
    text += "Schedule: " + ScheduleDescription() + "\n";
    text += "Status: " + status + "\n";
    text += StringFormat("Open positions: %d   Last crossover: %s", CountOpenPositions(), lastSignal);
 
    Comment(text);
+  }
+
+//+------------------------------------------------------------------+
+string LotDescription()
+  {
+   if(InpLotMode == LOT_MODE_RISK)
+      return(StringFormat("Risk: %.2f%% per trade", InpRiskPercent));
+   return(StringFormat("Lots: %.2f", g_lotSize));
   }
 
 //+------------------------------------------------------------------+
@@ -753,7 +820,7 @@ string StopsDescription()
 string OptionsDescription()
   {
    string breakEven = InpUseBreakEven
-                      ? StringFormat("at +%.1f pips (lock %.1f)", InpBreakEvenTrigger, InpBreakEvenLock)
+                      ? StringFormat("at %.2f x SL (lock %.1f pips)", InpBreakEvenTriggerR, InpBreakEvenLock)
                       : "off";
    string trailing  = InpUseTrailingStop
                       ? StringFormat("from +%.1f pips, %.1f pips behind", InpTrailingStart, InpTrailingDistance)
