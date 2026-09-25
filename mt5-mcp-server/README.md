@@ -45,21 +45,30 @@ Every order and every refusal is written to `mt5_mcp_actions.log`, next to the s
 
 ## Installation (Windows)
 
-1. Install **Python 3.12** from python.org. During the setup, tick *Add python.exe to PATH*.
+1. Install **Python 3.12 or 3.13** from python.org. You don't need the *Add python.exe to PATH* option, because
+   step 5 uses the full path to Python.
 2. Copy this folder to `C:\mt5-mcp-server`.
-3. Open a command prompt and install the dependencies:
+3. Open a command prompt and install the dependencies. The `py` launcher comes with every python.org install:
    ```
-   pip install -r C:\mt5-mcp-server\requirements.txt
+   py -m pip install -r C:\mt5-mcp-server\requirements.txt
    ```
-4. Install **Claude Desktop** and sign in.
-5. In Claude Desktop, open **Settings → Developer → Edit Config**. Copy the content of
-   `claude_desktop_config.example.json` into `claude_desktop_config.json`. If the file already has an
-   `mcpServers` section, add the `metatrader5` entry to it.
+   If `py` is not found, use `python` instead of `py`.
+4. Print the full path to Python:
+   ```
+   py -c "import sys; print(sys.executable)"
+   ```
+5. Install **Claude Desktop** and sign in. Open **Settings → Developer → Edit Config**, and copy the content of
+   `claude_desktop_config.example.json` into `claude_desktop_config.json`. Replace the `command` value with
+   the path from step 4, and write every `\` as `\\`. If the file already has an `mcpServers` section, add
+   the `metatrader5` entry to it.
 6. Open MetaTrader 5, log in to a **demo** account and enable **Algo Trading**.
 7. Quit Claude Desktop completely (including the tray icon), then start it again. The `metatrader5` tools
    now appear in the tools menu of a new conversation.
 
 Try: *"Show me my MetaTrader account and the EURUSD price."*
+
+If `pip` says that no version of `MetaTrader5` matches, your Python is too recent for the MetaTrader5
+package. Install Python 3.12 or 3.13 as well, and use `py -3.12` or `py -3.13` instead of `py` in steps 3 and 4.
 
 ## Testing without MetaTrader
 

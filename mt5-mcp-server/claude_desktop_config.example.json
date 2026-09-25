@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "metatrader5": {
-      "command": "python",
+      "command": "C:\\Users\\YOUR_NAME\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
       "args": ["C:\\mt5-mcp-server\\mt5_mcp_server.py"],
       "env": {
         "MT5_MAX_LOTS": "0.10",
