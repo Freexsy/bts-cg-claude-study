@@ -1,0 +1,6 @@
+imageio-ffmpeg
+matplotlib
+numpy
+opencv-python-headless
+pillow
+yt-dlp
