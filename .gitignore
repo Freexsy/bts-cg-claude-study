@@ -1,0 +1,11 @@
+# Vidéos de référence et images extraites : contenu de tiers, le dépôt est public.
+refs/**/*.mp4
+refs/**/*.mov
+refs/**/*.webm
+refs/**/*.info.json
+refs/**/planche_*.jpg
+refs/**/plans_*.jpg
+refs/**/passage_*.jpg
+refs/**/plans_hd/
+
+__pycache__/
